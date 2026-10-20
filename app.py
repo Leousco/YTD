@@ -512,7 +512,14 @@ class YTDownloaderApp:
 
     def _clear_url(self):
         self.url_entry.delete(0, tk.END)
-        self._schedule_estimate()
+        self._estimate_token += 1
+        if self._estimate_job is not None:
+            self.root.after_cancel(self._estimate_job)
+            self._estimate_job = None
+        self.estimate_value.configure(text="—")
+        self.estimate_info.configure(text="Paste a link to see the file size")
+        self._set_status("Ready")
+        self._reset_stats()
 
     def _browse_folder(self):
         selected_dir = filedialog.askdirectory(initialdir=self.download_dir)
@@ -789,6 +796,10 @@ class YTDownloaderApp:
         try:
             with YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])
+
+            if self.cancel_event.is_set():
+                self._ui(self._on_cancelled)
+                return
 
             downloaded_file_size = downloaded_file_sizes[-1] if downloaded_file_sizes else None
             self._ui(self._on_success, downloaded_file_size)
