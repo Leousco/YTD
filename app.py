@@ -1,860 +1,918 @@
+import json
+import math
 import os
+import queue
+import re
+import subprocess
+import sys
 import threading
-import tkinter as tk
+import time
+from datetime import datetime
+from pathlib import Path
 from tkinter import filedialog, messagebox
-from yt_dlp import YoutubeDL
-from yt_dlp.utils import DownloadError, DownloadCancelled
 
 import customtkinter as ctk
+import yt_dlp
+from PIL import Image, ImageDraw
 
-ctk.set_appearance_mode("Dark")
-ctk.set_default_color_theme("blue")
-ctk.ThemeManager.theme["CTkFont"]["family"] = "Segoe UI"
+CONFIG_DIR = Path.home() / ".streamgrab"
+HISTORY_FILE = CONFIG_DIR / "history.json"
+SETTINGS_FILE = CONFIG_DIR / "settings.json"
 
-BG = "#0B0D14"
-SURFACE = "#141824"
-SURFACE_ALT = "#1B2132"
-BORDER = "#262D42"
-VIDEO = "#7C5CFF"
-VIDEO_HOVER = "#6849F0"
-AUDIO = "#F97316"
-AUDIO_HOVER = "#EA580C"
-CYAN = "#22D3EE"
-TEXT = "#EDEFF7"
-MUTED = "#8A93AD"
-DANGER = "#F0506E"
-DANGER_HOVER = "#D13A58"
-SUCCESS = "#34D399"
-WARN = "#FBBF24"
+C = dict(
+    bg="#0a0c16", card="#11142a", card2="#1a1e3a", border="#252b4d",
+    text="#f1f3fb", muted="#8a90b0", accent="#f97316", accent_h="#fb8b3d",
+    purple="#8b6cff", purple_h="#a18bff", cyan="#22d3ee", green="#34d399",
+    red="#ef4444", red_h="#f87171",
+)
+
+YT_RE = re.compile(r"(youtube\.com|youtu\.be|music\.youtube\.com)", re.I)
+VID_RE = re.compile(r"(?:v=|youtu\.be/|shorts/|embed/)([\w-]{11})")
+MP4_Q = ["Best available", "1080p", "720p", "480p", "360p"]
+MP3_Q = ["320 kbps (Best)", "256 kbps", "192 kbps", "128 kbps"]
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+HEVC_HW = (
+    ("hevc_nvenc", ["-preset", "p5", "-rc", "vbr", "-cq", "28", "-b:v", "0"]),
+    ("hevc_qsv", ["-preset", "medium", "-global_quality", "27"]),
+    ("hevc_amf", ["-quality", "balanced", "-rc", "cqp", "-qp_i", "28", "-qp_p", "28"]),
+    ("hevc_videotoolbox", ["-q:v", "55"]),
+)
+HEVC_SW = ("libx265", ["-crf", "26", "-preset", "faster"])
+HEVC_CHOICE = []
 
 
-class YTDownloaderApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Streamgrab")
-        self.root.geometry("720x650")
-        self.root.minsize(640, 560)
-        self.root.configure(fg_color=BG)
+def load_json(path, default):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
 
-        self.download_dir = os.path.join(os.getcwd(), "Downloads")
-        os.makedirs(self.download_dir, exist_ok=True)
 
-        self.downloading = False
-        self.cancel_event = threading.Event()
-        self._estimate_job = None
-        self._estimate_token = 0
+def save_json(path, data):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
-        self.video_qualities = [
-            "Best / 1080p Max",
-            "720p",
-            "480p",
-            "360p",
-            "Highest Available (4K/1440p)",
-        ]
-        self.audio_qualities = [
-            "320 kbps (Best)",
-            "256 kbps",
-            "192 kbps",
-            "128 kbps",
-        ]
 
-        self.format_var = tk.StringVar(value="MP4 (Video)")
-        self.quality_var = tk.StringVar(value=self.video_qualities[0])
+def fmt_bytes(n):
+    if not n:
+        return "—"
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
 
-        self._is_fullscreen = False
-        self._last_size = (0, 0)
 
-        self._setup_ui()
-        self._apply_mode()
+def fmt_dur(s):
+    if not s:
+        return "—"
+    s = int(s)
+    h, r = divmod(s, 3600)
+    m, sec = divmod(r, 60)
+    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
 
-        self.root.bind("<F11>", self._toggle_fullscreen)
-        self.root.bind("<Escape>", self._exit_fullscreen)
-        self.root.bind("<Configure>", self._on_resize)
-        # self.root.after(50, self._maximize) # Auto Full Screen on Startup
 
-    def _maximize(self):
+def lerp_color(a, b, t):
+    a = [int(a[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(b[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#" + "".join(f"{int(x + (y - x) * t):02x}" for x, y in zip(a, b))
+
+
+def open_path(p):
+    if sys.platform == "win32":
+        os.startfile(p)
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", p])
+    else:
+        subprocess.Popen(["xdg-open", p])
+
+
+def reveal(p):
+    p = os.path.normpath(p)
+    if sys.platform == "win32":
+        subprocess.Popen(f'explorer /select,"{p}"')
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", "-R", p])
+    else:
+        subprocess.Popen(["xdg-open", os.path.dirname(p)])
+
+
+def ffmpeg_works(args):
+    try:
+        return subprocess.run(["ffmpeg", "-v", "error", *args], stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, creationflags=NO_WINDOW, timeout=30).returncode == 0
+    except Exception:
+        return False
+
+
+def hevc_encoders():
+    if HEVC_CHOICE:
+        return HEVC_CHOICE[0]
+    try:
+        listing = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True,
+                                 errors="ignore", creationflags=NO_WINDOW, timeout=30).stdout
+    except Exception:
+        listing = ""
+    found = []
+    for name, params in HEVC_HW:
+        if name in listing and ffmpeg_works(["-f", "lavfi", "-i", "color=c=black:s=640x360:r=30:d=0.5",
+                                             "-c:v", name, *params, "-f", "null", "-"]):
+            found.append((name, params))
+            break
+    found.append(HEVC_SW)
+    HEVC_CHOICE.append(found)
+    return found
+
+
+def estimate_size(info, fmt, q):
+    dur = info.get("duration") or 0
+    if fmt == "MP3":
+        kb = int(re.match(r"\d+", q).group())
+        return dur * kb * 1000 / 8
+
+    def fs(f):
+        return f.get("filesize") or f.get("filesize_approx") or (f.get("tbr") or 0) * 1000 / 8 * dur
+
+    m = re.match(r"\d+", q)
+    h = int(m.group()) if m else 99999
+    fl = info.get("formats") or []
+    vids = [f for f in fl if f.get("vcodec") not in (None, "none") and f.get("acodec") in (None, "none")
+            and (f.get("height") or 0) <= h]
+    auds = [f for f in fl if f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")]
+    vids = [f for f in vids if f.get("ext") == "mp4"] or vids
+    auds = [f for f in auds if f.get("ext") == "m4a"] or auds
+    v = max(vids, key=lambda f: ((f.get("height") or 0), fs(f)), default=None)
+    a = max(auds, key=fs, default=None)
+    total = (fs(v) if v else 0) + (fs(a) if a else 0)
+    return total or None
+
+
+def _bez(p0, p1, p2, p3, n=40):
+    pts = []
+    for i in range(n + 1):
+        t = i / n
+        u = 1 - t
+        pts.append((u ** 3 * p0[0] + 3 * u * u * t * p1[0] + 3 * u * t * t * p2[0] + t ** 3 * p3[0],
+                    u ** 3 * p0[1] + 3 * u * u * t * p1[1] + 3 * u * t * t * p2[1] + t ** 3 * p3[1]))
+    return pts
+
+
+def _fit(layer, px, fill_ratio, dx=0.0):
+    box = layer.getchannel("A").getbbox()
+    layer = layer.crop(box)
+    w, h = layer.size
+    s = px * fill_ratio / max(w, h)
+    layer = layer.resize((max(1, round(w * s)), max(1, round(h * s))), Image.LANCZOS)
+    out = Image.new("RGBA", (px, px), (0, 0, 0, 0))
+    out.paste(layer, ((px - layer.width) // 2 + round(layer.width * dx), (px - layer.height) // 2), layer)
+    return out
+
+
+def note_image(px=96, color="#ffffff", fill_ratio=0.62):
+    k = 8
+    S = 100 * k
+    img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    cx, cy, rx, ry, ang = 36, 74, 17, 12.5, math.radians(-22)
+    head = []
+    for i in range(120):
+        t = 2 * math.pi * i / 120
+        x, y = rx * math.cos(t), ry * math.sin(t)
+        head.append(((cx + x * math.cos(ang) - y * math.sin(ang)) * k, (cy + x * math.sin(ang) + y * math.cos(ang)) * k))
+    d.polygon(head, fill=color)
+    d.rectangle([49 * k, 14 * k, 55.5 * k, 75 * k], fill=color)
+    outer = _bez((55.5, 14), (60, 36), (83, 40), (80, 68))
+    inner = _bez((80, 68), (76, 50), (62, 48), (55.5, 40))
+    d.polygon([(x * k, y * k) for x, y in outer + inner], fill=color)
+    return _fit(img, px, fill_ratio)
+
+
+def play_image(px=96, color="#ffffff", fill_ratio=0.5):
+    k = 8
+    S = 100 * k
+    img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    pts = [(24 * k, 14 * k), (24 * k, 86 * k), (86 * k, 50 * k)]
+    d.polygon(pts, fill=color)
+    d.line(pts + [pts[0], pts[1]], fill=color, width=10 * k, joint="curve")
+    return _fit(img, px, fill_ratio, dx=0.04)
+
+
+def search_image(px=72, color="#8a90b0"):
+    k = 8
+    S = px * k
+    img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    w = S * 0.11
+    cx, cy, r = S * 0.42, S * 0.42, S * 0.28
+    d.ellipse([cx - r, cy - r, cx + r, cy + r], outline=color, width=round(w))
+    a = math.radians(45)
+    x0, y0 = cx + (r + w * 0.2) * math.cos(a), cy + (r + w * 0.2) * math.sin(a)
+    x1, y1 = S * 0.88, S * 0.88
+    d.line([x0, y0, x1, y1], fill=color, width=round(w * 1.1))
+    for x, y in ((x1, y1),):
+        rr = w * 1.1 / 2
+        d.ellipse([x - rr, y - rr, x + rr, y + rr], fill=color)
+    return img.resize((px, px), Image.LANCZOS)
+
+
+class App(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        ctk.set_appearance_mode("dark")
+        self.title("Streamgrab")
+        self.geometry("780x680")
+        self.minsize(640, 560)
+        self.configure(fg_color=C["bg"])
+
+        self.settings = load_json(SETTINGS_FILE, {})
+        self.history = load_json(HISTORY_FILE, [])
+        self.ui_q = queue.Queue()
+        self.cancel_flag = threading.Event()
+        self.proc = None
+        self.busy = False
+        self.info = None
+        self.fetch_id = 0
+        self.deb = None
+        self.last_clip = ""
+        self.last_path = None
+        self.target_p = 0.0
+        self.shown_p = 0.0
+        self.pulse_t = 0.0
+        self.dot_color = C["green"]
+        self.active_accent = C["accent"]
+        self.fmt = self.settings.get("format", "MP3")
+
+        self.url_var = ctk.StringVar()
+        self.url_var.trace_add("write", self.on_url_change)
+        self.folder_var = ctk.StringVar(value=self.settings.get("folder", str(Path.home() / "Downloads")))
+        self.quality_var = ctk.StringVar()
+        self.hevc_var = ctk.BooleanVar(value=self.settings.get("hevc", False))
+        self.search_var = ctk.StringVar()
+        self.search_var.trace_add("write", lambda *_: self.render_history())
+        self.icon_note = ctk.CTkImage(note_image(96), size=(48, 48))
+        self.icon_play = ctk.CTkImage(play_image(96), size=(48, 48))
+        self.icon_search = ctk.CTkImage(search_image(72), size=(18, 18))
+        self.title_full = ""
+        self.build_header()
+        self.build_download_page()
+        self.build_history_page()
+        self.set_format(self.fmt, initial=True)
+        self.show_page("Download")
+
+        self.bind("<FocusIn>", self.on_focus)
+        self.bind("<Return>", lambda e: self.fetch_info() if self.focus_get() else None)
+        self.after(30, self.poll)
+        self.tick()
+        self.pulse()
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.attributes("-alpha", 0.0)
+        self.fade_in()
+
+    def fade_in(self, a=0.0):
+        a = min(1.0, a + 0.08)
+        self.attributes("-alpha", a)
+        if a < 1.0:
+            self.after(16, lambda: self.fade_in(a))
+
+    def ui(self, fn, *args):
+        self.ui_q.put((fn, args))
+
+    def poll(self):
         try:
-            self.root.state("zoomed")
-        except tk.TclError:
-            try:
-                self.root.attributes("-zoomed", True)
-            except tk.TclError:
-                w, h = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-                self.root.geometry(f"{w}x{h}+0+0")
+            while True:
+                fn, args = self.ui_q.get_nowait()
+                fn(*args)
+        except queue.Empty:
+            pass
+        self.after(30, self.poll)
 
-    def _toggle_fullscreen(self, _event=None):
-        self._is_fullscreen = not self._is_fullscreen
-        self.root.attributes("-fullscreen", self._is_fullscreen)
-        if not self._is_fullscreen:
-            self.root.after(50, self._maximize)
+    def label(self, parent, text, size=12, bold=False, color=None, **kw):
+        return ctk.CTkLabel(parent, text=text, text_color=color or C["text"],
+                            font=ctk.CTkFont(size=size, weight="bold" if bold else "normal"), **kw)
 
-    def _exit_fullscreen(self, _event=None):
-        if self._is_fullscreen:
-            self._toggle_fullscreen()
+    def card(self, parent, **kw):
+        return ctk.CTkFrame(parent, fg_color=C["card"], corner_radius=18, border_width=1,
+                            border_color=C["border"], **kw)
 
-    def _on_resize(self, event):
-        if event.widget is not self.root:
-            return
-        size = (event.width, event.height)
-        if size == self._last_size:
-            return
-        self._last_size = size
-        width, height = size
-        value_size = min(15 + max(0, width - 720) // 60, 26)
-        pad = min(8 + max(0, height - 640) // 22, 34)
-        self.stat_font.configure(size=value_size)
-        for inner in self._stat_inners:
-            inner.pack_configure(pady=pad)
+    def build_header(self):
+        head = ctk.CTkFrame(self, fg_color="transparent")
+        head.pack(fill="x", padx=24, pady=(20, 8))
+        logo = ctk.CTkLabel(head, text="", image=self.icon_note, width=48, height=48, corner_radius=14,
+                            fg_color=C["accent"])
+        logo.pack(side="left")
+        self.logo = logo
+        box = ctk.CTkFrame(head, fg_color="transparent")
+        box.pack(side="left", padx=14)
+        self.label(box, "Streamgrab", 22, True).pack(anchor="w")
+        self.label(box, "Download YouTube video or audio in a few clicks", 12, color=C["muted"]).pack(anchor="w")
+        self.tabs = ctk.CTkSegmentedButton(
+            head, values=["Download", "History"], command=self.show_page, height=36,
+            fg_color=C["card"], selected_color=C["accent"], selected_hover_color=C["accent_h"],
+            unselected_color=C["card"], unselected_hover_color=C["card2"], corner_radius=12,
+            font=ctk.CTkFont(size=13, weight="bold"))
+        self.tabs.pack(side="right")
+        self.tabs.set("Download")
+        self.pages = ctk.CTkFrame(self, fg_color="transparent")
+        self.pages.pack(fill="both", expand=True, padx=24, pady=(4, 20))
 
-    def _card(self, parent, **grid):
-        card = ctk.CTkFrame(
-            parent,
-            height=1,
-            fg_color=SURFACE,
-            corner_radius=16,
-            border_width=1,
-            border_color=BORDER,
-        )
-        card.grid(sticky="ew", **grid)
-        return card
-
-    def _caption(self, parent, text):
-        return ctk.CTkLabel(
-            parent,
-            text=text.upper(),
-            font=ctk.CTkFont(size=10, weight="bold"),
-            text_color=MUTED,
-        )
-
-    def _stat_tile(self, parent, column, title, accent):
-        tile = ctk.CTkFrame(parent, height=1, fg_color=SURFACE_ALT, corner_radius=12)
-        tile.grid(
-            row=0,
-            column=column,
-            sticky="nsew",
-            padx=(0 if column == 0 else 5, 0 if column == 2 else 5),
-        )
-        bar = ctk.CTkFrame(tile, fg_color=accent, width=3, height=1, corner_radius=2)
-        bar.pack(side="left", fill="y", padx=(10, 0), pady=10)
-        inner = ctk.CTkFrame(tile, fg_color="transparent", height=1)
-        inner.pack(side="left", fill="both", expand=True, padx=10, pady=8)
-        self._stat_inners.append(inner)
-        self._caption(inner, title).pack(anchor="w")
-        value = ctk.CTkLabel(
-            inner,
-            text="—",
-            font=self.stat_font,
-            text_color=TEXT,
-            anchor="w",
-        )
-        value.pack(anchor="w")
-        return value
-
-    def _setup_ui(self):
-        self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(0, weight=1)
-
-        page = ctk.CTkFrame(self.root, fg_color="transparent")
-        page.grid(row=0, column=0, sticky="nsew", padx=22, pady=16)
-        page.columnconfigure(0, weight=1)
-        page.rowconfigure(4, weight=1)
-
-        header = ctk.CTkFrame(page, fg_color="transparent")
-        header.grid(row=0, column=0, sticky="ew", pady=(0, 12))
-        header.columnconfigure(1, weight=1)
-
-        self.badge = ctk.CTkFrame(header, fg_color=VIDEO, width=52, height=52, corner_radius=14)
-        self.badge.grid(row=0, column=0, rowspan=2, padx=(0, 12))
-        self.badge.grid_propagate(False)
-        self.icon_canvas = tk.Canvas(
-            self.badge, width=36, height=36, bg=VIDEO, highlightthickness=0, bd=0
-        )
-        self.icon_canvas.place(relx=0.5, rely=0.5, anchor="center")
-
-        ctk.CTkLabel(
-            header,
-            text="Streamgrab",
-            font=ctk.CTkFont(size=22, weight="bold"),
-            text_color=TEXT,
-            anchor="w",
-        ).grid(row=0, column=1, sticky="w")
-        ctk.CTkLabel(
-            header,
-            text="Download YouTube video or audio in a few clicks",
-            font=ctk.CTkFont(size=11),
-            text_color=MUTED,
-            anchor="w",
-        ).grid(row=1, column=1, sticky="w")
-
-        source = self._card(page, row=1, column=0, pady=(0, 10))
-        source.columnconfigure(0, weight=1)
-        self._caption(source, "Video link").grid(row=0, column=0, sticky="w", padx=16, pady=(12, 5))
-
-        url_row = ctk.CTkFrame(source, fg_color="transparent", height=38)
-        url_row.grid(row=1, column=0, sticky="ew", padx=16)
-        url_row.columnconfigure(0, weight=1)
-
-        self.url_entry = ctk.CTkEntry(
-            url_row,
-            placeholder_text="Paste a YouTube or YouTube Music URL",
-            height=38,
-            corner_radius=10,
-            fg_color=SURFACE_ALT,
-            border_color=BORDER,
-            text_color=TEXT,
-        )
-        self.url_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
-        self.url_entry.bind("<KeyRelease>", lambda e: self._schedule_estimate())
-
-        ctk.CTkButton(
-            url_row,
-            text="Paste",
-            width=66,
-            height=38,
-            corner_radius=10,
-            fg_color=SURFACE_ALT,
-            hover_color=BORDER,
-            border_width=1,
-            border_color=BORDER,
-            text_color=TEXT,
-            command=self._paste_url,
-        ).grid(row=0, column=1, padx=(0, 8))
-        ctk.CTkButton(
-            url_row,
-            text="Clear",
-            width=66,
-            height=38,
-            corner_radius=10,
-            fg_color=SURFACE_ALT,
-            hover_color=DANGER,
-            border_width=1,
-            border_color=BORDER,
-            text_color=TEXT,
-            command=self._clear_url,
-        ).grid(row=0, column=2)
-
-        estimate_row = ctk.CTkFrame(source, fg_color="transparent", height=20)
-        estimate_row.grid(row=2, column=0, sticky="ew", padx=16, pady=(8, 12))
-        ctk.CTkLabel(
-            estimate_row,
-            text="Estimated size:",
-            font=ctk.CTkFont(size=12),
-            text_color=MUTED,
-        ).pack(side="left")
-        self.estimate_value = ctk.CTkLabel(
-            estimate_row,
-            text="—",
-            font=ctk.CTkFont(size=12, weight="bold"),
-            text_color=CYAN,
-        )
-        self.estimate_value.pack(side="left", padx=(6, 8))
-        self.estimate_info = ctk.CTkLabel(
-            estimate_row,
-            text="Paste a link to see the file size",
-            font=ctk.CTkFont(size=12),
-            text_color=MUTED,
-            anchor="w",
-        )
-        self.estimate_info.pack(side="left", fill="x", expand=True)
-
-        options = self._card(page, row=2, column=0, pady=(0, 10))
-        options.columnconfigure(0, weight=1)
-        options.columnconfigure(1, weight=1)
-
-        self._caption(options, "Format").grid(row=0, column=0, sticky="w", padx=16, pady=(12, 5))
-        self._caption(options, "Quality").grid(row=0, column=1, sticky="w", padx=16, pady=(12, 5))
-
-        toggle = ctk.CTkFrame(options, fg_color="transparent", height=38)
-        toggle.grid(row=1, column=0, sticky="ew", padx=16)
-        toggle.columnconfigure(0, weight=1, uniform="fmt")
-        toggle.columnconfigure(1, weight=1, uniform="fmt")
-
-        self.video_btn = ctk.CTkButton(
-            toggle,
-            text="MP4 · Video",
-            height=38,
-            corner_radius=10,
-            border_width=1,
-            font=ctk.CTkFont(size=13, weight="bold"),
-            command=lambda: self._select_format("MP4 (Video)"),
-        )
-        self.video_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        self.audio_btn = ctk.CTkButton(
-            toggle,
-            text="MP3 · Audio",
-            height=38,
-            corner_radius=10,
-            border_width=1,
-            font=ctk.CTkFont(size=13, weight="bold"),
-            command=lambda: self._select_format("MP3 (Audio)"),
-        )
-        self.audio_btn.grid(row=0, column=1, sticky="ew", padx=(4, 0))
-
-        self.quality_dropdown = ctk.CTkOptionMenu(
-            options,
-            values=self.video_qualities,
-            variable=self.quality_var,
-            command=lambda _: self._schedule_estimate(),
-            height=38,
-            corner_radius=10,
-            fg_color=SURFACE_ALT,
-            button_color=BORDER,
-            dropdown_fg_color=SURFACE_ALT,
-            text_color=TEXT,
-            anchor="w",
-        )
-        self.quality_dropdown.grid(row=1, column=1, sticky="ew", padx=16)
-
-        self._caption(options, "Save to").grid(row=2, column=0, columnspan=2, sticky="w", padx=16, pady=(12, 5))
-
-        dest_row = ctk.CTkFrame(options, fg_color="transparent", height=36)
-        dest_row.grid(row=3, column=0, columnspan=2, sticky="ew", padx=16, pady=(0, 14))
-        dest_row.columnconfigure(0, weight=1)
-
-        self.folder_label = ctk.CTkEntry(
-            dest_row,
-            height=36,
-            corner_radius=10,
-            fg_color=SURFACE_ALT,
-            border_color=BORDER,
-            text_color=MUTED,
-        )
-        self.folder_label.insert(0, self.download_dir)
-        self.folder_label.configure(state="disabled")
-        self.folder_label.grid(row=0, column=0, sticky="ew", padx=(0, 8))
-
-        ctk.CTkButton(
-            dest_row,
-            text="Browse",
-            width=90,
-            height=36,
-            corner_radius=10,
-            fg_color=SURFACE_ALT,
-            hover_color=BORDER,
-            border_width=1,
-            border_color=BORDER,
-            text_color=TEXT,
-            command=self._browse_folder,
-        ).grid(row=0, column=1)
-
-        button_row = ctk.CTkFrame(page, fg_color="transparent", height=46)
-        button_row.grid(row=3, column=0, sticky="ew", pady=(0, 10))
-        button_row.columnconfigure(0, weight=1, uniform="btns")
-        button_row.columnconfigure(1, weight=1, uniform="btns")
-
-        self.download_btn = ctk.CTkButton(
-            button_row,
-            text="Download",
-            font=ctk.CTkFont(size=15, weight="bold"),
-            height=46,
-            corner_radius=14,
-            text_color_disabled="#D5D8E6",
-            command=self._start_download_thread,
-        )
-        self.download_btn.grid(row=0, column=0, sticky="ew", padx=(0, 5))
-
-        self.cancel_btn = ctk.CTkButton(
-            button_row,
-            text="Cancel",
-            font=ctk.CTkFont(size=15, weight="bold"),
-            height=46,
-            corner_radius=14,
-            text_color_disabled="#F6D3DB",
-            command=self._cancel_download,
-        )
-        self.cancel_btn.grid(row=0, column=1, sticky="ew", padx=(5, 0))
-        self._set_cancel_idle()
-
-        progress_card = self._card(page, row=4, column=0)
-        progress_card.grid_configure(sticky="new")
-        progress_card.columnconfigure(0, weight=1)
-
-        top = ctk.CTkFrame(progress_card, fg_color="transparent", height=20)
-        top.grid(row=0, column=0, sticky="ew", padx=16, pady=(12, 6))
-        top.columnconfigure(0, weight=1)
-
-        self.status_label = ctk.CTkLabel(
-            top,
-            text="Ready",
-            font=ctk.CTkFont(size=13, weight="bold"),
-            text_color=TEXT,
-            anchor="w",
-        )
-        self.status_label.grid(row=0, column=0, sticky="w")
-
-        self.percent_label = ctk.CTkLabel(
-            top,
-            text="0%",
-            font=ctk.CTkFont(size=13, weight="bold"),
-            text_color=CYAN,
-        )
-        self.percent_label.grid(row=0, column=1, sticky="e")
-
-        self.progress_bar = ctk.CTkProgressBar(
-            progress_card,
-            height=8,
-            corner_radius=4,
-            fg_color=SURFACE_ALT,
-        )
-        self.progress_bar.set(0.0)
-        self.progress_bar.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 10))
-
-        self.stat_font = ctk.CTkFont(size=15, weight="bold")
-        self._stat_inners = []
-
-        stats = ctk.CTkFrame(progress_card, height=1, fg_color="transparent")
-        stats.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 14))
-        stats.rowconfigure(0, weight=1)
-        for col in range(3):
-            stats.columnconfigure(col, weight=1, uniform="stat")
-
-        self.downloaded_value = self._stat_tile(stats, 0, "Downloaded", VIDEO)
-        self.remaining_value = self._stat_tile(stats, 1, "Remaining", CYAN)
-        self.speed_value = self._stat_tile(stats, 2, "Speed · ETA", SUCCESS)
-
-    def _ui(self, func, *args):
-        self.root.after(0, lambda: func(*args))
-
-    def _mode_colors(self):
-        if "MP3" in self.format_var.get():
-            return AUDIO, AUDIO_HOVER
-        return VIDEO, VIDEO_HOVER
-
-    def _apply_mode(self):
-        color, hover = self._mode_colors()
-        is_audio = "MP3" in self.format_var.get()
-
-        self._style_toggle(self.video_btn, VIDEO, VIDEO_HOVER, not is_audio)
-        self._style_toggle(self.audio_btn, AUDIO, AUDIO_HOVER, is_audio)
-
-        self.download_btn.configure(fg_color=color, hover_color=hover)
-        self.progress_bar.configure(progress_color=color)
-        self.badge.configure(fg_color=color)
-        self._draw_icon(is_audio, color)
-        self.quality_dropdown.configure(button_hover_color=color, dropdown_hover_color=color)
-
-    def _draw_icon(self, is_audio, bg):
-        c = self.icon_canvas
-        c.configure(bg=bg)
-        c.delete("all")
-        w = dict(fill="white", outline="white")
-        line = dict(fill="white", width=2.4, capstyle="round", joinstyle="round")
-        if is_audio:
-            c.create_oval(4, 17, 12, 25, **w)
-            c.create_oval(17, 14, 25, 22, **w)
-            c.create_line(11, 21, 11, 5, 24, 3, 24, 18, **line)
-            c.create_line(11, 10, 24, 8, **line)
+    def show_page(self, name):
+        for p in (self.dl_page, self.hist_page):
+            p.pack_forget()
+        if name == "Download":
+            self.dl_page.pack(fill="both", expand=True)
         else:
-            c.create_polygon(
-                5, 4, 23, 4, 24, 5, 24, 23, 23, 24, 5, 24, 4, 23, 4, 5,
-                fill="", outline="white", width=2.4, joinstyle="round",
-            )
-            c.create_line(9, 4, 9, 24, **line)
-            c.create_line(19, 4, 19, 24, **line)
-            for y in (9, 14, 19):
-                c.create_line(4, y, 9, y, **line)
-                c.create_line(19, y, 24, y, **line)
-        c.scale("all", 0, 0, 36 / 28, 36 / 28)
+            self.hist_page.pack(fill="both", expand=True)
+            self.render_history()
+        self.tabs.set(name)
 
-    def _set_cancel_idle(self):
-        self.cancel_btn.configure(
-            state="disabled",
-            text="Cancel",
-            fg_color="#2A1E2C",
-            text_color_disabled="#7C5E6B",
-        )
+    def build_download_page(self):
+        pg = self.dl_page = ctk.CTkFrame(self.pages, fg_color="transparent")
 
-    def _set_cancel_active(self):
-        self.cancel_btn.configure(
-            state="normal",
-            text="Cancel",
-            fg_color=DANGER,
-            hover_color=DANGER_HOVER,
-        )
+        link = self.card(pg)
+        link.pack(fill="x")
+        self.label(link, "MEDIA LINK", 10, True, C["muted"]).pack(anchor="w", padx=16, pady=(12, 5))
+        row = ctk.CTkFrame(link, fg_color="transparent")
+        row.pack(fill="x", padx=20)
+        self.url_entry = ctk.CTkEntry(row, textvariable=self.url_var, height=38, corner_radius=11,
+                                      fg_color=C["card2"], border_color=C["border"], border_width=1,
+                                      placeholder_text="Paste a YouTube or YouTube Music URL",
+                                      font=ctk.CTkFont(size=13))
+        self.url_entry.pack(side="left", fill="x", expand=True)
+        self.url_hint = ctk.CTkLabel(self.url_entry, text="Paste a YouTube video or music link", text_color=C["muted"],
+                             fg_color="transparent", font=ctk.CTkFont(size=13), height=20)
+        self.url_hint.place(x=12, rely=0.5, anchor="w")
+        self.url_hint.bind("<Button-1>", lambda e: self.url_entry.focus_set())
+        self.url_var.trace_add("write", lambda *_: self.sync_url_hint())
+        for text, cmd in (("Paste", self.paste), ("Clear", self.clear)):
+            ctk.CTkButton(row, text=text, width=68, height=38, corner_radius=11, fg_color=C["card2"],
+                          hover_color=C["border"], border_width=1, border_color=C["border"],
+                          command=cmd).pack(side="left", padx=(8, 0))
 
-    def _style_toggle(self, button, color, hover, active):
-        if active:
-            button.configure(
-                fg_color=color,
-                hover_color=hover,
-                border_color=color,
-                text_color="white",
-            )
-        else:
-            button.configure(
-                fg_color=SURFACE_ALT,
-                hover_color=BORDER,
-                border_color=color,
-                text_color=color,
-            )
+        self.preview = ctk.CTkFrame(link, fg_color=C["card2"], corner_radius=12, height=42)
+        self.preview.pack(fill="x", padx=16, pady=(10, 12))
+        self.preview.pack_propagate(False)
+        self.info_row = ctk.CTkFrame(self.preview, fg_color="transparent")
+        self.info_row.pack(fill="both", expand=True, padx=14)
+        self.title_lbl = self.label(self.info_row, "Paste a link to get started", 12, True, anchor="w")
+        self.title_lbl.pack(side="left")
+        self.meta_lbl = self.label(self.info_row, "Length and estimated size will show here", 12,
+                                   color=C["cyan"], anchor="w")
+        self.meta_lbl.pack(side="left", padx=(14, 0))
+        self.title_full = "Paste a link to get started"
+        self.info_row.bind("<Configure>", lambda e: self.fit_title())
 
-    def _select_format(self, selected_format):
-        if self.downloading:
+        opts = self.card(pg)
+        opts.pack(fill="x", pady=9)
+        top = ctk.CTkFrame(opts, fg_color="transparent")
+        top.pack(fill="x", padx=16, pady=(12, 0))
+        left = ctk.CTkFrame(top, fg_color="transparent")
+        left.pack(side="left", fill="x", expand=True)
+        self.label(left, "FORMAT", 11, True, C["muted"]).pack(anchor="w", pady=(0, 6))
+        fr = ctk.CTkFrame(left, fg_color="transparent")
+        fr.pack(anchor="w")
+        self.fmt_btns = {}
+        for f, txt in (("MP4", "MP4 · Video"), ("MP3", "MP3 · Audio")):
+            b = ctk.CTkButton(fr, text=txt, width=136, height=36, corner_radius=10, border_width=1,
+                              font=ctk.CTkFont(size=13, weight="bold"), command=lambda f=f: self.set_format(f))
+            b.pack(side="left", padx=(0, 10))
+            self.fmt_btns[f] = b
+        right = ctk.CTkFrame(top, fg_color="transparent")
+        right.pack(side="right")
+        self.label(right, "QUALITY", 11, True, C["muted"]).pack(anchor="w", pady=(0, 6))
+        self.quality_menu = ctk.CTkOptionMenu(
+            right, variable=self.quality_var, values=MP3_Q, width=180, height=36, corner_radius=10,
+            fg_color=C["card2"], button_color=C["border"], button_hover_color=C["purple"],
+            dropdown_fg_color=C["card2"], dropdown_hover_color=C["border"], command=lambda _: self.after_quality())
+        self.quality_menu.pack()
+
+        self.label(opts, "SAVE TO", 10, True, C["muted"]).pack(anchor="w", padx=16, pady=(11, 5))
+        sr = ctk.CTkFrame(opts, fg_color="transparent")
+        sr.pack(fill="x", padx=20)
+        ctk.CTkEntry(sr, textvariable=self.folder_var, height=36, corner_radius=10, fg_color=C["card2"],
+                     border_color=C["border"], border_width=1).pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(sr, text="Browse", width=76, height=36, corner_radius=10, fg_color=C["card2"],
+                      hover_color=C["border"], border_width=1, border_color=C["border"],
+                      command=self.browse).pack(side="left", padx=(8, 0))
+        ctk.CTkButton(sr, text="Open", width=58, height=36, corner_radius=10, fg_color=C["card2"],
+                      hover_color=C["border"], border_width=1, border_color=C["border"],
+                      command=lambda: open_path(self.folder_var.get()) if os.path.isdir(self.folder_var.get()) else None
+                      ).pack(side="left", padx=(8, 0))
+        self.hevc_sw = ctk.CTkSwitch(opts, text="Convert to HEVC (H.265) after download · smaller file, slower",
+                                     variable=self.hevc_var, progress_color=C["purple"], text_color=C["muted"],
+                                     font=ctk.CTkFont(size=12), command=self.save_settings)
+        self.hevc_sw.pack(anchor="w", padx=16, pady=(10, 12))
+
+        act = ctk.CTkFrame(pg, fg_color="transparent")
+        act.pack(fill="x")
+        act.grid_columnconfigure((0, 1), weight=1, uniform="a")
+        self.dl_btn = ctk.CTkButton(act, text="Download", height=44, corner_radius=12, fg_color=C["accent"],
+                                    hover_color=C["accent_h"], font=ctk.CTkFont(size=15, weight="bold"),
+                                    command=self.start_download)
+        self.dl_btn.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self.cancel_btn = ctk.CTkButton(act, text="Cancel", height=44, corner_radius=12, fg_color="#2a1f2e",
+                                        hover_color=C["red_h"], text_color_disabled="#5a4a5e", state="disabled",
+                                        font=ctk.CTkFont(size=15, weight="bold"), command=self.cancel)
+        self.cancel_btn.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+
+        prog = self.card(pg)
+        prog.pack(fill="x", pady=(9, 12))
+        sr = ctk.CTkFrame(prog, fg_color="transparent")
+        sr.pack(fill="x", padx=16, pady=(11, 6))
+        self.dot = ctk.CTkLabel(sr, text="●", text_color=C["green"], font=ctk.CTkFont(size=14))
+        self.dot.pack(side="left")
+        self.status_lbl = self.label(sr, "Ready", 14, True, anchor="w")
+        self.status_lbl.pack(side="left", padx=8)
+        self.pct_lbl = self.label(sr, "0%", 13, True, C["cyan"])
+        self.pct_lbl.pack(side="right")
+        self.show_btn = ctk.CTkButton(sr, text="Show file", width=84, height=28, corner_radius=10,
+                                      fg_color=C["card2"], hover_color=C["border"], state="disabled",
+                                      command=lambda: self.last_path and reveal(self.last_path))
+        self.show_btn.pack(side="right", padx=12)
+        self.bar = ctk.CTkProgressBar(prog, height=8, corner_radius=4, fg_color=C["card2"],
+                                      progress_color=C["accent"])
+        self.bar.set(0)
+        self.bar.pack(fill="x", padx=16)
+        stats = ctk.CTkFrame(prog, fg_color="transparent")
+        stats.pack(fill="x", padx=11, pady=(10, 12))
+        stats.grid_columnconfigure((0, 1, 2), weight=1, uniform="s")
+        self.stat = {}
+        for i, (key, title, col) in enumerate((("done", "DOWNLOADED", C["purple"]),
+                                              ("left", "REMAINING", C["cyan"]),
+                                              ("speed", "SPEED · ETA", C["green"]))):
+            box = ctk.CTkFrame(stats, fg_color=C["card2"], corner_radius=10, height=60)
+            box.pack_propagate(False)
+            box.grid(row=0, column=i, sticky="ew", padx=5)
+            ctk.CTkFrame(box, width=3, height=2, fg_color=col, corner_radius=2).pack(side="left", fill="y", padx=(10, 0), pady=9)
+            inner = ctk.CTkFrame(box, fg_color="transparent")
+            inner.pack(side="left", padx=8, pady=9)
+            self.label(inner, title, 9, True, C["muted"], height=14).pack(anchor="w")
+            v = self.label(inner, "—", 15, True, height=20)
+            v.pack(anchor="w")
+            v.configure(font=ctk.CTkFont(size=13, weight="bold"))
+            self.stat[key] = v
+
+    def build_history_page(self):
+        pg = self.hist_page = ctk.CTkFrame(self.pages, fg_color="transparent")
+        bar = ctk.CTkFrame(pg, fg_color="transparent")
+        bar.pack(fill="x", pady=(0, 10))
+        search_box = ctk.CTkFrame(bar, height=42, corner_radius=12, fg_color=C["card"], border_width=1,
+                                  border_color=C["border"])
+        search_box.pack(side="left", fill="x", expand=True)
+        ctk.CTkLabel(search_box, text="", image=self.icon_search, fg_color="transparent",
+                     width=18, height=18).pack(side="left", padx=(14, 0))
+        ctk.CTkEntry(search_box, textvariable=self.search_var, height=38, corner_radius=10,
+                     fg_color=C["card"], border_width=0, placeholder_text_color=C["muted"],
+                     placeholder_text="Search downloads").pack(side="left", fill="both", expand=True,
+                                                               padx=(4, 6), pady=2)
+        ctk.CTkButton(bar, text="Clear all", width=90, height=42, corner_radius=12, fg_color=C["card"],
+                      hover_color=C["red"], border_width=1, border_color=C["border"],
+                      command=self.clear_history).pack(side="left", padx=(8, 0))
+        self.count_lbl = self.label(pg, "", 12, color=C["muted"], anchor="w")
+        self.count_lbl.pack(anchor="w", pady=(0, 6))
+        self.hist_list = ctk.CTkScrollableFrame(
+            pg, fg_color="transparent", scrollbar_fg_color=C["card"],
+            scrollbar_button_color="#69749a", scrollbar_button_hover_color="#aab5dc")
+        self.hist_list.pack(fill="both", expand=True)
+
+    def render_history(self):
+        for w in self.hist_list.winfo_children():
+            w.destroy()
+        q = self.search_var.get().lower().strip()
+        items = [e for e in self.history if q in e["title"].lower()]
+        self.count_lbl.configure(text=f"{len(items)} download{'s' if len(items) != 1 else ''}, newest first")
+        if not items:
+            self.label(self.hist_list, "Nothing here yet. Your downloads will appear in this list.", 13,
+                       color=C["muted"]).pack(pady=60)
             return
-        self.format_var.set(selected_format)
-        options = self.audio_qualities if "MP3" in selected_format else self.video_qualities
-        self.quality_var.set(options[0])
-        self.quality_dropdown.configure(values=options)
-        self._apply_mode()
-        self._schedule_estimate()
+        last_day = None
+        for i, e in enumerate(items[:300]):
+            dt = datetime.fromisoformat(e["time"])
+            day = self.day_label(dt)
+            if day != last_day:
+                self.label(self.hist_list, day.upper(), 11, True, C["muted"], anchor="w").pack(
+                    anchor="w", pady=(10, 2), padx=4)
+                last_day = day
+            self.history_row(e, dt, latest=(i == 0 and not q))
 
-    def _set_status(self, text, color=TEXT):
-        self.status_label.configure(text=text, text_color=color)
+    def day_label(self, dt):
+        d = (datetime.now().date() - dt.date()).days
+        if d == 0:
+            return "Today"
+        if d == 1:
+            return "Yesterday"
+        return dt.strftime("%a, %b %d, %Y")
 
-    def _paste_url(self):
+    def history_row(self, e, dt, latest):
+        exists = os.path.exists(e["path"])
+        row = ctk.CTkFrame(self.hist_list, fg_color=C["card"], corner_radius=14, border_width=1,
+                           border_color=C["green"] if latest else C["border"])
+        row.pack(fill="x", pady=4, padx=2)
+        row.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(row, text=e["format"], width=48, height=48, corner_radius=12,
+                     fg_color=C["purple"] if e["format"] == "MP4" else C["accent"], text_color="white",
+                     font=ctk.CTkFont(size=12, weight="bold")).grid(row=0, column=0, rowspan=2, padx=12, pady=12)
+        tf = ctk.CTkFrame(row, fg_color="transparent")
+        tf.grid(row=0, column=1, sticky="w", pady=(12, 0))
+        title = e["title"] if len(e["title"]) <= 52 else e["title"][:51] + "…"
+        self.label(tf, title, 13, True, C["text"] if exists else C["muted"]).pack(side="left")
+        if latest:
+            ctk.CTkLabel(tf, text="LATEST", fg_color=C["green"], text_color="#06281c", corner_radius=6,
+                         height=18, width=52, font=ctk.CTkFont(size=10, weight="bold")).pack(side="left", padx=8)
+        sub = f"{dt.strftime('%I:%M %p').lstrip('0')}  ·  {fmt_bytes(e.get('size'))}  ·  {e.get('quality', '')}"
+        if not exists:
+            sub += "  ·  file moved or deleted"
+        self.label(row, sub, 11, color=C["red_h"] if not exists else C["muted"]).grid(
+            row=1, column=1, sticky="w", pady=(0, 12))
+        btns = ctk.CTkFrame(row, fg_color="transparent")
+        btns.grid(row=0, column=2, rowspan=2, padx=10)
+        specs = [("Open", lambda: open_path(e["path"]), exists), ("Folder", lambda: reveal(e["path"]), exists),
+                 ("Link", lambda: self.copy_link(e["url"]), True)]
+        for text, cmd, ok in specs:
+            ctk.CTkButton(btns, text=text, width=56, height=30, corner_radius=9, fg_color=C["card2"],
+                          hover_color=C["border"], font=ctk.CTkFont(size=11),
+                          state="normal" if ok else "disabled", command=cmd).pack(side="left", padx=2)
+        ctk.CTkButton(btns, text="✕", width=30, height=30, corner_radius=9, fg_color=C["card2"],
+                      hover_color=C["red"], font=ctk.CTkFont(size=11),
+                      command=lambda: self.delete_entry(e)).pack(side="left", padx=2)
+
+    def copy_link(self, url):
+        self.clipboard_clear()
+        self.clipboard_append(url)
+        self.set_state("ready", "Link copied to clipboard")
+
+    def delete_entry(self, e):
+        self.history = [h for h in self.history if h is not e]
+        save_json(HISTORY_FILE, self.history)
+        self.render_history()
+
+    def clear_history(self):
+        if self.history and messagebox.askyesno("Clear history", "Remove all entries from the history log?\nYour files are not deleted."):
+            self.history = []
+            save_json(HISTORY_FILE, self.history)
+            self.render_history()
+
+    def set_format(self, f, initial=False):
+        self.fmt = f
+        accent = C["purple"] if f == "MP4" else C["accent"]
+        accent_hover = C["purple_h"] if f == "MP4" else C["accent_h"]
+        self.active_accent = accent
+        self.logo.configure(image=self.icon_play if f == "MP4" else self.icon_note, fg_color=accent)
+        self.tabs.configure(selected_color=accent, selected_hover_color=accent_hover)
+        self.dl_btn.configure(fg_color=accent, hover_color=accent_hover)
+        self.bar.configure(progress_color=accent)
+        for k, b in self.fmt_btns.items():
+            on = k == f
+            col = C["purple"] if k == "MP4" else C["accent"]
+            hov = C["purple_h"] if k == "MP4" else C["accent_h"]
+            b.configure(fg_color=col if on else C["card2"], hover_color=hov if on else C["border"],
+                        border_color=col if on else C["border"], text_color="white" if on else C["muted"])
+        vals = MP4_Q if f == "MP4" else MP3_Q
+        self.quality_menu.configure(values=vals)
+        saved = self.settings.get(f"quality_{f}")
+        self.quality_var.set(saved if saved in vals else vals[0])
+        if f == "MP3":
+            self.hevc_var.set(False)
+        self.hevc_sw.configure(state="normal" if f == "MP4" else "disabled")
+        if not initial:
+            self.save_settings()
+        self.refresh_preview_meta()
+
+    def after_quality(self):
+        self.save_settings()
+        self.refresh_preview_meta()
+
+    def save_settings(self):
+        self.settings.update(folder=self.folder_var.get(), format=self.fmt, hevc=self.hevc_var.get())
+        self.settings[f"quality_{self.fmt}"] = self.quality_var.get()
+        save_json(SETTINGS_FILE, self.settings)
+
+    def on_close(self):
+        self.save_settings()
+        self.cancel_flag.set()
+        self.destroy()
+
+    def browse(self):
+        d = filedialog.askdirectory(initialdir=self.folder_var.get())
+        if d:
+            self.folder_var.set(d)
+            self.save_settings()
+
+    def paste(self):
         try:
-            clipboard_text = self.root.clipboard_get()
-            self.url_entry.delete(0, tk.END)
-            self.url_entry.insert(0, clipboard_text.strip())
-        except tk.TclError:
-            return
-        self._schedule_estimate()
-
-    def _clear_url(self):
-        self.url_entry.delete(0, tk.END)
-        self._estimate_token += 1
-        if self._estimate_job is not None:
-            self.root.after_cancel(self._estimate_job)
-            self._estimate_job = None
-        self.estimate_value.configure(text="—")
-        self.estimate_info.configure(text="Paste a link to see the file size")
-        self._set_status("Ready")
-        self._reset_stats()
-
-    def _browse_folder(self):
-        selected_dir = filedialog.askdirectory(initialdir=self.download_dir)
-        if selected_dir:
-            self.download_dir = selected_dir
-            self.folder_label.configure(state="normal")
-            self.folder_label.delete(0, tk.END)
-            self.folder_label.insert(0, self.download_dir)
-            self.folder_label.configure(state="disabled")
-
-    def _format_size(self, size_bytes):
-        if size_bytes is None:
-            return "Unknown"
-        size_bytes = float(size_bytes)
-        for unit in ["B", "KB", "MB", "GB", "TB"]:
-            if size_bytes < 1024 or unit == "TB":
-                return f"{size_bytes:.2f} {unit}"
-            size_bytes /= 1024
-
-    def _format_eta(self, seconds):
-        if seconds is None:
-            return "--"
-        seconds = int(seconds)
-        minutes, secs = divmod(seconds, 60)
-        hours, minutes = divmod(minutes, 60)
-        if hours:
-            return f"{hours}h {minutes:02d}m"
-        if minutes:
-            return f"{minutes}m {secs:02d}s"
-        return f"{secs}s"
-
-    def _format_duration(self, seconds):
-        if not seconds:
-            return ""
-        seconds = int(seconds)
-        minutes, secs = divmod(seconds, 60)
-        hours, minutes = divmod(minutes, 60)
-        if hours:
-            return f"{hours}:{minutes:02d}:{secs:02d}"
-        return f"{minutes}:{secs:02d}"
-
-    def _video_format_string(self, quality):
-        if "1080p" in quality:
-            return "bestvideo[height<=1080]+bestaudio/best"
-        if "720p" in quality:
-            return "bestvideo[height<=720]+bestaudio/best"
-        if "480p" in quality:
-            return "bestvideo[height<=480]+bestaudio/best"
-        if "360p" in quality:
-            return "bestvideo[height<=360]+bestaudio/best"
-        return "bestvideo+bestaudio/best"
-
-    def _schedule_estimate(self):
-        if self._estimate_job is not None:
-            self.root.after_cancel(self._estimate_job)
-        self._estimate_job = self.root.after(600, self._start_estimate)
-
-    def _start_estimate(self):
-        self._estimate_job = None
-        url = self.url_entry.get().strip()
-        self._estimate_token += 1
-        token = self._estimate_token
-
-        if not url:
-            self.estimate_value.configure(text="—")
-            self.estimate_info.configure(text="Paste a link to see the file size")
-            return
-
-        if self.downloading:
-            return
-
-        self.estimate_value.configure(text="Calculating...")
-        self.estimate_info.configure(text="")
-
-        fmt = self.format_var.get()
-        quality = self.quality_var.get()
-        thread = threading.Thread(
-            target=self._estimate_worker,
-            args=(url, fmt, quality, token),
-            daemon=True,
-        )
-        thread.start()
-
-    def _estimate_worker(self, url, fmt, quality, token):
-        is_audio = "MP3" in fmt
-        opts = {
-            "format": "bestaudio/best" if is_audio else self._video_format_string(quality),
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-            "skip_download": True,
-            "js_runtimes": {"node": {}},
-        }
-
-        try:
-            with YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-
-            title = info.get("title") or ""
-            duration = info.get("duration")
-
-            if is_audio:
-                bitrate = int(quality.split()[0])
-                size = duration * bitrate * 125 if duration else None
-            else:
-                formats = info.get("requested_formats") or [info]
-                size = self._sum_sizes(formats, duration)
-
-            self._ui(self._show_estimate, token, size, title, duration, False)
+            self.url_var.set(self.clipboard_get().strip())
         except Exception:
-            self._ui(self._show_estimate, token, None, "", None, True)
+            pass
 
-    def _sum_sizes(self, formats, duration):
-        total = 0
-        for fmt in formats:
-            size = fmt.get("filesize") or fmt.get("filesize_approx")
-            if not size and fmt.get("tbr") and duration:
-                size = fmt["tbr"] * 125 * duration
-            if not size:
-                return None
-            total += size
-        return total
+    def clear(self):
+        self.url_var.set("")
+        self.fetch_id += 1
+        self.info = None
+        self.set_title("Paste a link to get started")
+        self.set_meta("Length and estimated size will show here")
+        if self.deb:
+            self.after_cancel(self.deb)
+            self.deb = None
+        if not self.busy:
+            self.target_p = self.shown_p = 0.0
+            self.bar.set(0)
+            self.pct_lbl.configure(text="0%")
+            for value in self.stat.values():
+                value.configure(text="—")
+            self.show_btn.configure(state="disabled")
+            self.set_state("ready", "Ready")
 
-    def _show_estimate(self, token, size, title, duration, failed):
-        if token != self._estimate_token:
+    def on_focus(self, e):
+        if e.widget is not self or self.url_var.get().strip() or self.busy:
             return
-
-        if failed:
-            self.estimate_value.configure(text="Unavailable")
-            self.estimate_info.configure(text="Could not read this link")
-            return
-
-        if size:
-            self.estimate_value.configure(text=f"≈ {self._format_size(size)}")
-        else:
-            self.estimate_value.configure(text="Unknown")
-
-        short_title = title if len(title) <= 46 else title[:43] + "..."
-        parts = [p for p in (self._format_duration(duration), short_title) if p]
-        self.estimate_info.configure(text="  ·  ".join(parts))
-
-    def _reset_stats(self):
-        self.progress_bar.set(0.0)
-        self.percent_label.configure(text="0%")
-        self.downloaded_value.configure(text="—")
-        self.remaining_value.configure(text="—")
-        self.speed_value.configure(text="—")
-
-    def _progress_hook(self, d):
-        status = d.get("status")
-
-        if status == "downloading":
-            if self.cancel_event.is_set():
-                raise DownloadCancelled()
-
-            total_bytes = d.get("total_bytes") or d.get("total_bytes_estimate")
-            downloaded_bytes = d.get("downloaded_bytes", 0) or 0
-            speed = d.get("speed")
-            eta = d.get("eta")
-
-            if total_bytes and total_bytes > 0:
-                fraction = min(downloaded_bytes / total_bytes, 1.0)
-                remaining_bytes = max(total_bytes - downloaded_bytes, 0)
-                remaining_text = self._format_size(remaining_bytes)
-                percent_text = f"{fraction * 100:.1f}%"
-            else:
-                fraction = None
-                remaining_text = "Unknown"
-                percent_text = "..."
-
-            speed_text = f"{self._format_size(speed)}/s" if speed else "--"
-            speed_line = f"{speed_text} · {self._format_eta(eta)}"
-            downloaded_text = self._format_size(downloaded_bytes)
-
-            self._ui(
-                self._update_progress,
-                fraction,
-                percent_text,
-                downloaded_text,
-                remaining_text,
-                speed_line,
-            )
-
-        elif status == "finished":
-            self._ui(self._on_stream_finished, d.get("downloaded_bytes", 0))
-
-    def _update_progress(self, fraction, percent_text, downloaded_text, remaining_text, speed_line):
-        if not self.downloading:
-            return
-        if fraction is not None:
-            self.progress_bar.set(fraction)
-        self.percent_label.configure(text=percent_text)
-        if not self.cancel_event.is_set():
-            self._set_status("Downloading")
-        self.downloaded_value.configure(text=downloaded_text)
-        self.remaining_value.configure(text=remaining_text)
-        self.speed_value.configure(text=speed_line)
-
-    def _on_stream_finished(self, downloaded_bytes):
-        if not self.downloading:
-            return
-        self.progress_bar.set(1.0)
-        self.percent_label.configure(text="100%")
-        self._set_status("Processing file...")
-        self.downloaded_value.configure(text=self._format_size(downloaded_bytes))
-        self.remaining_value.configure(text="0.00 B")
-        self.speed_value.configure(text="—")
-
-    def _start_download_thread(self):
-        url = self.url_entry.get().strip()
-
-        if not url:
-            self._set_status("Paste a video link first", DANGER)
-            return
-
-        if self.downloading:
-            return
-
-        self.downloading = True
-        self.cancel_event.clear()
-        self.download_btn.configure(state="disabled", text="Downloading...")
-        self._set_cancel_active()
-        self._set_status("Starting download...")
-        self._reset_stats()
-
-        thread = threading.Thread(target=self._run_download, args=(url,), daemon=True)
-        thread.start()
-
-    def _cancel_download(self):
-        if not self.downloading or self.cancel_event.is_set():
-            return
-        if not messagebox.askyesno(
-            "Cancel download?",
-            "Are you sure you want to cancel the current download?",
-            parent=self.root,
-        ):
-            return
-        if not self.downloading or self.cancel_event.is_set():
-            return
-        self.cancel_event.set()
-        self.cancel_btn.configure(state="disabled", text="Cancelling...")
-        self._set_status("Cancelling...", WARN)
-
-    def _run_download(self, url):
-        fmt = self.format_var.get()
-        quality = self.quality_var.get()
-        download_dir = self.download_dir
-
-        ydl_opts = {
-            "outtmpl": os.path.join(download_dir, "%(title)s.%(ext)s"),
-            "progress_hooks": [self._progress_hook],
-            "post_hooks": [],
-            "noplaylist": True,
-            "js_runtimes": {"node": {}},
-        }
-        downloaded_file_sizes = []
-        ydl_opts["post_hooks"].append(
-            lambda filepath: downloaded_file_sizes.append(os.path.getsize(filepath))
-        )
-
-        if "MP3" in fmt:
-            bitrate = quality.split()[0]
-            ydl_opts.update({
-                "format": "bestaudio/best",
-                "postprocessors": [{
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": bitrate,
-                }],
-            })
-        else:
-            ydl_opts.update({"format": self._video_format_string(quality)})
-
         try:
-            with YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
+            clip = self.clipboard_get().strip()
+        except Exception:
+            return
+        if YT_RE.search(clip) and clip != self.last_clip:
+            self.last_clip = clip
+            self.url_var.set(clip)
 
-            if self.cancel_event.is_set():
-                self._ui(self._on_cancelled)
+    def animate_height(self, widget, target):
+        cur = widget.cget("height")
+        if abs(cur - target) <= 2:
+            widget.configure(height=target)
+            return
+        widget.configure(height=int(cur + (target - cur) * 0.35))
+        self.after(16, lambda: self.animate_height(widget, target))
+
+    def on_url_change(self, *_):
+        if self.deb:
+            self.after_cancel(self.deb)
+        self.deb = self.after(450, self.fetch_info)
+
+    def fetch_info(self):
+        url = self.url_var.get().strip()
+        self.fetch_id += 1
+        fid = self.fetch_id
+        self.info = None
+        if not YT_RE.search(url):
+            self.set_title("Paste a link to get started" if not url else "That doesn't look like a YouTube link")
+            self.set_meta("Length and estimated size will show here")
+            return
+        self.set_title("Fetching details…")
+        self.set_meta("")
+        threading.Thread(target=self._fetch, args=(url, fid), daemon=True).start()
+
+    def _fetch(self, url, fid):
+        try:
+            with yt_dlp.YoutubeDL({"quiet": True, "noplaylist": True, "skip_download": True,
+                                   "no_warnings": True}) as ydl:
+                info = ydl.extract_info(url, download=False)
+            self.ui(self._fetched, fid, info)
+        except Exception:
+            self.ui(self._fetched, fid, None)
+
+    def _fetched(self, fid, info):
+        if fid != self.fetch_id:
+            return
+        if not info:
+            self.set_title("Couldn't read that link")
+            self.set_meta("Check the URL and your connection")
+            return
+        self.info = info
+        t = info.get("title", "Untitled")
+        self.set_title(t)
+        self.refresh_preview_meta()
+
+    def refresh_preview_meta(self):
+        if not self.info:
+            return
+        size = estimate_size(self.info, self.fmt, self.quality_var.get())
+        parts = [fmt_dur(self.info.get("duration")), f"~ {fmt_bytes(size)}" if size else ""]
+        self.set_meta("  ·  ".join(p for p in parts if p))
+    
+    def sync_url_hint(self):
+        if self.url_var.get():
+            self.url_hint.place_forget()
+        else:
+            self.url_hint.place(x=12, rely=0.5, anchor="w")
+
+    def set_title(self, text):
+        self.title_full = text
+        self.title_lbl.configure(text=text)
+        self.after(10, self.fit_title)
+
+    def set_meta(self, text):
+        self.meta_lbl.configure(text=text)
+        self.after(10, self.fit_title)
+
+    def fit_title(self):
+        text = self.title_full
+        avail = self.info_row.winfo_width() - self.meta_lbl.winfo_reqwidth() - 14 - 12
+        if avail <= 40 or not text:
+            return
+        font = self.title_lbl.cget("font")
+        if font.measure(text) > avail:
+            lo, hi = 1, len(text)
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if font.measure(text[:mid].rstrip() + "…") <= avail:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            text = text[:lo].rstrip() + "…"
+        if self.title_lbl.cget("text") != text:
+            self.title_lbl.configure(text=text)
+
+    def current_vid(self):
+        m = VID_RE.search(self.url_var.get())
+        return m.group(1) if m else (self.info or {}).get("id")
+
+    def find_dup(self, fmt):
+        vid = self.current_vid()
+        if not vid:
+            return None
+        for e in self.history:
+            if e.get("vid") == vid and e["format"] == fmt and os.path.exists(e["path"]):
+                return e
+        return None
+
+    def set_state(self, kind, text):
+        self.dot_color = {"ready": C["green"], "busy": C["accent"], "error": C["red_h"], "done": C["green"],
+                          "cancelled": C["accent"]}[kind]
+        text_color = {"busy": C["cyan"], "cancelled": C["accent"], "done": C["green"],
+                      "error": C["red_h"]}.get(kind, C["text"])
+        self.dot.configure(text_color=self.dot_color)
+        self.status_lbl.configure(text=text, text_color=text_color)
+
+    def tick(self):
+        diff = self.target_p - self.shown_p
+        if diff:
+            self.shown_p = self.target_p if abs(diff) <= 0.0005 else self.shown_p + diff * 0.18
+            self.bar.set(max(0, min(1, self.shown_p)))
+            self.pct_lbl.configure(text=f"{int(self.shown_p * 100)}%")
+        self.after(16, self.tick)
+
+    def pulse(self):
+        if self.busy:
+            self.pulse_t += 0.25
+            k = (math.sin(self.pulse_t) + 1) / 2
+            self.dot.configure(text_color=lerp_color(self.active_accent, C["card"], k * 0.8))
+        self.after(40, self.pulse)
+
+    def set_busy(self, b):
+        self.busy = b
+        self.dl_btn.configure(state="disabled" if b else "normal", text="Downloading…" if b else "Download")
+        self.cancel_btn.configure(state="normal" if b else "disabled", fg_color=C["red"] if b else "#2a1f2e")
+
+    def start_download(self):
+        url = self.url_var.get().strip()
+        if not YT_RE.search(url):
+            self.url_entry.configure(border_color=C["red"])
+            self.after(900, lambda: self.url_entry.configure(border_color=C["border"]))
+            self.set_state("error", "Paste a valid YouTube link first")
+            return
+        dup = self.find_dup(self.fmt)
+        if dup:
+            when = datetime.fromisoformat(dup["time"]).strftime("%b %d at %I:%M %p")
+            if not messagebox.askyesno("Already downloaded",
+                                       f"You already downloaded this as {dup['format']} on {when}:\n\n{dup['title']}\n\nDownload it again?"):
                 return
+        folder = self.folder_var.get()
+        os.makedirs(folder, exist_ok=True)
+        self.save_settings()
+        self.cancel_flag.clear()
+        self.target_p = self.shown_p = 0.0
+        self.bar.set(0)
+        self.pct_lbl.configure(text="0%")
+        self.show_btn.configure(state="disabled")
+        for v in self.stat.values():
+            v.configure(text="—")
+        self.set_busy(True)
+        self.set_state("busy", "Starting…")
+        threading.Thread(target=self._worker, args=(url, self.fmt, self.quality_var.get(), folder,
+                                                    self.hevc_var.get()), daemon=True).start()
 
-            downloaded_file_size = downloaded_file_sizes[-1] if downloaded_file_sizes else None
-            self._ui(self._on_success, downloaded_file_size)
+    def cancel(self):
+        self.cancel_flag.set()
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+        self.set_state("busy", "Cancelling…")
 
-        except DownloadCancelled:
-            self._ui(self._on_cancelled)
-        except DownloadError as e:
-            if self.cancel_event.is_set():
-                self._ui(self._on_cancelled)
+    def _worker(self, url, fmt, q, folder, hevc):
+        stage = [0]
+
+        def hook(d):
+            if self.cancel_flag.is_set():
+                raise yt_dlp.utils.DownloadCancelled()
+            if d["status"] == "downloading":
+                total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                done = d.get("downloaded_bytes") or 0
+                n = len(d.get("info_dict", {}).get("requested_formats") or []) or 1
+                frac = (done / total) if total else 0
+                p = min(1.0, (stage[0] + frac) / n)
+                self.ui(self._progress, p, done, total, d.get("speed"), d.get("eta"))
+            elif d["status"] == "finished":
+                stage[0] += 1
+
+        def pp_hook(d):
+            if d["status"] == "started":
+                self.ui(self.set_state, "busy", "Processing…")
+
+        opts = {"outtmpl": os.path.join(folder, "%(title)s.%(ext)s"), "noplaylist": True, "quiet": True,
+                "no_warnings": True, "progress_hooks": [hook], "postprocessor_hooks": [pp_hook],
+                "windowsfilenames": True}
+        if fmt == "MP3":
+            opts["format"] = "bestaudio/best"
+            opts["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3",
+                                       "preferredquality": re.match(r"\d+", q).group()}]
+        else:
+            m = re.match(r"\d+", q)
+            cap = f"[height<={m.group()}]" if m else ""
+            opts["format"] = f"bestvideo{cap}[ext=mp4]+bestaudio[ext=m4a]/best{cap}[ext=mp4]/best{cap}"
+            opts["merge_output_format"] = "mp4"
+        try:
+            self.ui(self.set_state, "busy", "Downloading…")
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                rd = info.get("requested_downloads") or []
+                path = rd[0].get("filepath") if rd else None
+                if not path or not os.path.exists(path):
+                    base = os.path.splitext(ydl.prepare_filename(info))[0]
+                    path = base + (".mp3" if fmt == "MP3" else ".mp4")
+            if self.cancel_flag.is_set():
+                raise yt_dlp.utils.DownloadCancelled()
+            if fmt == "MP4" and hevc:
+                path = self._to_hevc(path, info.get("duration"))
+            entry = {"title": info.get("title", Path(path).stem), "url": url, "vid": info.get("id"),
+                     "format": fmt, "quality": q, "path": os.path.normpath(path),
+                     "size": os.path.getsize(path), "time": datetime.now().isoformat(timespec="seconds")}
+            self.ui(self._done, entry)
+        except yt_dlp.utils.DownloadCancelled:
+            self.ui(self._failed, "Cancelled", True)
+        except Exception as ex:
+            if self.cancel_flag.is_set():
+                self.ui(self._failed, "Cancelled", True)
             else:
-                self._ui(self._on_failure, "Download failed", f"Download Error: {e}")
-        except Exception as e:
-            if self.cancel_event.is_set():
-                self._ui(self._on_cancelled)
-            else:
-                self._ui(self._on_failure, "Unexpected error", f"Error: {e}")
+                msg = str(ex).replace("ERROR: ", "")
+                self.ui(self._failed, msg[:90] or "Download failed", False)
 
-    def _finish_state(self):
-        self.downloading = False
-        self.download_btn.configure(state="normal", text="Download")
-        self._set_cancel_idle()
+    def _to_hevc(self, path, duration=None):
+        self.ui(self.set_state, "busy", "Converting to HEVC…")
+        self.ui(self._hevc_progress, 0.0)
+        out = str(Path(path).with_suffix(".hevc.mp4"))
+        total_us = (duration or 0) * 1_000_000
+        for name, params in hevc_encoders():
+            cmd = ["ffmpeg", "-y", "-v", "error", "-nostats", "-progress", "pipe:1", "-i", path,
+                   "-c:v", name, *params, "-tag:v", "hvc1", "-c:a", "copy", out]
+            try:
+                self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                             text=True, errors="ignore", creationflags=NO_WINDOW)
+            except OSError:
+                raise RuntimeError("HEVC conversion failed. Is ffmpeg installed?")
+            for line in self.proc.stdout:
+                if total_us and line.startswith("out_time_us="):
+                    try:
+                        us = int(line.split("=", 1)[1])
+                    except ValueError:
+                        continue
+                    self.ui(self._hevc_progress, max(0.0, min(0.99, us / total_us)))
+            self.proc.wait()
+            if self.cancel_flag.is_set():
+                if os.path.exists(out):
+                    os.remove(out)
+                raise yt_dlp.utils.DownloadCancelled()
+            if self.proc.returncode == 0:
+                os.replace(out, path)
+                return path
+            if os.path.exists(out):
+                os.remove(out)
+        raise RuntimeError("HEVC conversion failed. Is ffmpeg installed?")
 
-    def _on_success(self, downloaded_file_size):
-        self._finish_state()
-        self._set_status("Download completed", SUCCESS)
-        self.progress_bar.set(1.0)
-        self.percent_label.configure(text="100%")
-        self.downloaded_value.configure(
-            text=self._format_size(downloaded_file_size) if downloaded_file_size is not None else "Unknown"
-        )
-        self.remaining_value.configure(text="0.00 B")
-        self.speed_value.configure(text="—")
+    def _hevc_progress(self, p):
+        self.target_p = p
+        self.status_lbl.configure(text=f"Converting to HEVC… {int(p * 100)}%")
 
-    def _on_cancelled(self):
-        self._finish_state()
-        self._set_status("Download cancelled", WARN)
-        self.progress_bar.set(0.0)
-        self.percent_label.configure(text="0%")
-        self.remaining_value.configure(text="—")
-        self.speed_value.configure(text="—")
+    def _progress(self, p, done, total, speed, eta):
+        self.target_p = p
+        if total:
+            self.stat["done"].configure(text=f"{fmt_bytes(done)} / {fmt_bytes(total)}")
+            self.stat["left"].configure(text=fmt_bytes(max(0, total - done)))
+        if speed:
+            self.stat["speed"].configure(text=f"{fmt_bytes(speed)}/s · {fmt_dur(eta) if eta else '—'}")
 
-    def _on_failure(self, status_text, log_text):
-        self._finish_state()
-        print(log_text)
-        detail = log_text.splitlines()[0] if log_text else ""
-        if len(detail) > 70:
-            detail = detail[:67] + "..."
-        self._set_status(f"{status_text}: {detail}" if detail else status_text, DANGER)
+    def _done(self, entry):
+        self.history.insert(0, entry)
+        save_json(HISTORY_FILE, self.history)
+        self.last_path = entry["path"]
+        self.target_p = 1.0
+        self.set_busy(False)
+        t = entry["title"]
+        self.set_state("done", "Download successful")
+        self.show_btn.configure(state="normal")
+        self.stat["done"].configure(text=fmt_bytes(entry["size"]))
+        self.stat["left"].configure(text="0 B")
 
-
-def main():
-    root = ctk.CTk()
-    YTDownloaderApp(root)
-    root.mainloop()
+    def _failed(self, msg, cancelled):
+        self.set_busy(False)
+        self.target_p = 0.0
+        self.set_state("cancelled" if cancelled else "error", "Download cancelled" if cancelled else msg)
 
 
 if __name__ == "__main__":
-    main()
+    App().mainloop()
