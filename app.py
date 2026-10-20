@@ -764,9 +764,14 @@ class YTDownloaderApp:
         ydl_opts = {
             "outtmpl": os.path.join(download_dir, "%(title)s.%(ext)s"),
             "progress_hooks": [self._progress_hook],
+            "post_hooks": [],
             "noplaylist": True,
             "js_runtimes": {"node": {}},
         }
+        downloaded_file_sizes = []
+        ydl_opts["post_hooks"].append(
+            lambda filepath: downloaded_file_sizes.append(os.path.getsize(filepath))
+        )
 
         if "MP3" in fmt:
             bitrate = quality.split()[0]
@@ -785,7 +790,8 @@ class YTDownloaderApp:
             with YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])
 
-            self._ui(self._on_success, download_dir)
+            downloaded_file_size = downloaded_file_sizes[-1] if downloaded_file_sizes else None
+            self._ui(self._on_success, downloaded_file_size)
 
         except DownloadCancelled:
             self._ui(self._on_cancelled)
@@ -805,11 +811,14 @@ class YTDownloaderApp:
         self.download_btn.configure(state="normal", text="Download")
         self._set_cancel_idle()
 
-    def _on_success(self, download_dir):
+    def _on_success(self, downloaded_file_size):
         self._finish_state()
         self._set_status("Download completed", SUCCESS)
         self.progress_bar.set(1.0)
         self.percent_label.configure(text="100%")
+        self.downloaded_value.configure(
+            text=self._format_size(downloaded_file_size) if downloaded_file_size is not None else "Unknown"
+        )
         self.remaining_value.configure(text="0.00 B")
         self.speed_value.configure(text="—")
 
