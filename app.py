@@ -10,6 +10,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox
+from tkinter import font as tkfont
 
 import customtkinter as ctk
 import yt_dlp
@@ -17,6 +18,7 @@ from PIL import Image, ImageDraw
 
 CONFIG_DIR = Path.home() / ".streamgrab"
 HISTORY_FILE = CONFIG_DIR / "history.json"
+HISTORY_LIMIT = 10
 SETTINGS_FILE = CONFIG_DIR / "settings.json"
 
 C = dict(
@@ -29,7 +31,9 @@ C = dict(
 YT_RE = re.compile(r"(youtube\.com|youtu\.be|music\.youtube\.com)", re.I)
 VID_RE = re.compile(r"(?:v=|youtu\.be/|shorts/|embed/)([\w-]{11})")
 MP4_Q = ["Best available", "1080p", "720p", "480p", "360p"]
-MP3_Q = ["320 kbps (Best)", "256 kbps", "192 kbps", "128 kbps"]
+M4A_Q = "M4A · Original"
+MP3_Q = [M4A_Q, "128 kbps", "192 kbps", "256 kbps", "320 kbps"]
+MP3_DEFAULT = "128 kbps"
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 HEVC_HW = (
     ("hevc_nvenc", ["-preset", "p5", "-rc", "vbr", "-cq", "28", "-b:v", "0"]),
@@ -125,12 +129,19 @@ def hevc_encoders():
 
 def estimate_size(info, fmt, q):
     dur = info.get("duration") or 0
-    if fmt == "MP3":
-        kb = int(re.match(r"\d+", q).group())
-        return dur * kb * 1000 / 8
 
     def fs(f):
         return f.get("filesize") or f.get("filesize_approx") or (f.get("tbr") or 0) * 1000 / 8 * dur
+
+    if fmt == "MP3" and q == M4A_Q:
+        fl = info.get("formats") or []
+        auds = [f for f in fl if f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")]
+        auds = [f for f in auds if f.get("ext") == "m4a"] or auds
+        a = max(auds, key=fs, default=None)
+        return (fs(a) if a else 0) or None
+    if fmt == "MP3":
+        kb = int(re.match(r"\d+", q).group())
+        return dur * kb * 1000 / 8
 
     m = re.match(r"\d+", q)
     h = int(m.group()) if m else 99999
@@ -215,17 +226,32 @@ def search_image(px=72, color="#8a90b0"):
     return img.resize((px, px), Image.LANCZOS)
 
 
+FONT_CANDIDATES = {
+    "win32": ["Segoe UI"],
+    "darwin": ["SF Pro Text", "Helvetica Neue"],
+}
+FONT_CANDIDATES_DEFAULT = ["Inter", "Noto Sans", "Ubuntu", "Cantarell", "DejaVu Sans"]
+
+
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
         ctk.set_appearance_mode("dark")
+        installed = set(tkfont.families(self))
+        for name in FONT_CANDIDATES.get(sys.platform, FONT_CANDIDATES_DEFAULT):
+            if name in installed:
+                ctk.ThemeManager.theme["CTkFont"]["family"] = name
+                break
         self.title("Streamgrab")
         self.geometry("780x680")
         self.minsize(640, 560)
         self.configure(fg_color=C["bg"])
 
         self.settings = load_json(SETTINGS_FILE, {})
-        self.history = load_json(HISTORY_FILE, [])
+        stored = load_json(HISTORY_FILE, [])
+        self.history = stored[:HISTORY_LIMIT]
+        if len(stored) > HISTORY_LIMIT:
+            save_json(HISTORY_FILE, self.history)
         self.ui_q = queue.Queue()
         self.cancel_flag = threading.Event()
         self.proc = None
@@ -248,7 +274,15 @@ class App(ctk.CTk):
         self.quality_var = ctk.StringVar()
         self.hevc_var = ctk.BooleanVar(value=self.settings.get("hevc", False))
         self.search_var = ctk.StringVar()
-        self.search_var.trace_add("write", lambda *_: self.render_history())
+        self.search_var.trace_add("write", lambda *_: self.schedule_search())
+        self.search_job = None
+        self.hist_sig = None
+        self.render_id = 0
+        self.font_cache = {}
+        self.fit_job = None
+        self.pending_progress = None
+        self.last_tick = time.perf_counter()
+        self.last_pulse = time.perf_counter()
         self.icon_note = ctk.CTkImage(note_image(96), size=(48, 48))
         self.icon_play = ctk.CTkImage(play_image(96), size=(48, 48))
         self.icon_search = ctk.CTkImage(search_image(72), size=(18, 18))
@@ -268,16 +302,21 @@ class App(ctk.CTk):
         self.attributes("-alpha", 0.0)
         self.fade_in()
 
-    def fade_in(self, a=0.0):
-        a = min(1.0, a + 0.08)
+    def fade_in(self, t0=None):
+        t0 = t0 or time.perf_counter()
+        a = min(1.0, (time.perf_counter() - t0) / 0.22)
         self.attributes("-alpha", a)
         if a < 1.0:
-            self.after(16, lambda: self.fade_in(a))
+            self.after(10, lambda: self.fade_in(t0))
 
     def ui(self, fn, *args):
         self.ui_q.put((fn, args))
 
     def poll(self):
+        pp = self.pending_progress
+        if pp is not None:
+            self.pending_progress = None
+            self._progress(*pp)
         try:
             while True:
                 fn, args = self.ui_q.get_nowait()
@@ -286,9 +325,16 @@ class App(ctk.CTk):
             pass
         self.after(30, self.poll)
 
+    def font(self, size, bold=False):
+        key = (size, bold)
+        f = self.font_cache.get(key)
+        if f is None:
+            f = self.font_cache[key] = ctk.CTkFont(size=size, weight="bold" if bold else "normal")
+        return f
+
     def label(self, parent, text, size=12, bold=False, color=None, **kw):
         return ctk.CTkLabel(parent, text=text, text_color=color or C["text"],
-                            font=ctk.CTkFont(size=size, weight="bold" if bold else "normal"), **kw)
+                            font=self.font(size, bold), **kw)
 
     def card(self, parent, **kw):
         return ctk.CTkFrame(parent, fg_color=C["card"], corner_radius=18, border_width=1,
@@ -359,7 +405,7 @@ class App(ctk.CTk):
                                    color=C["cyan"], anchor="w")
         self.meta_lbl.pack(side="left", padx=(14, 0))
         self.title_full = "Paste a link to get started"
-        self.info_row.bind("<Configure>", lambda e: self.fit_title())
+        self.info_row.bind("<Configure>", lambda e: self.queue_fit())
 
         opts = self.card(pg)
         opts.pack(fill="x", pady=9)
@@ -474,25 +520,52 @@ class App(ctk.CTk):
             scrollbar_button_color="#69749a", scrollbar_button_hover_color="#aab5dc")
         self.hist_list.pack(fill="both", expand=True)
 
+    def schedule_search(self):
+        if self.search_job:
+            self.after_cancel(self.search_job)
+        self.search_job = self.after(150, self.render_history)
+
     def render_history(self):
-        for w in self.hist_list.winfo_children():
-            w.destroy()
+        self.search_job = None
         q = self.search_var.get().lower().strip()
         items = [e for e in self.history if q in e["title"].lower()]
+        shown = items[:HISTORY_LIMIT]
+        sig = (q, len(items), datetime.now().date(),
+               tuple((e["time"], e["path"], os.path.exists(e["path"])) for e in shown))
+        if sig == self.hist_sig:
+            return
+        self.hist_sig = sig
+        self.render_id += 1
+        rid = self.render_id
+        for w in self.hist_list.winfo_children():
+            w.destroy()
         self.count_lbl.configure(text=f"{len(items)} download{'s' if len(items) != 1 else ''}, newest first")
         if not items:
             self.label(self.hist_list, "Nothing here yet. Your downloads will appear in this list.", 13,
                        color=C["muted"]).pack(pady=60)
             return
+        ops = []
         last_day = None
-        for i, e in enumerate(items[:300]):
+        for i, e in enumerate(shown):
             dt = datetime.fromisoformat(e["time"])
             day = self.day_label(dt)
             if day != last_day:
+                ops.append((day, None, None))
+                last_day = day
+            ops.append((None, e, (dt, i == 0 and not q)))
+        self.render_chunk(ops, 0, rid)
+
+    def render_chunk(self, ops, start, rid):
+        if rid != self.render_id:
+            return
+        for day, e, extra in ops[start:start + 6]:
+            if e is None:
                 self.label(self.hist_list, day.upper(), 11, True, C["muted"], anchor="w").pack(
                     anchor="w", pady=(10, 2), padx=4)
-                last_day = day
-            self.history_row(e, dt, latest=(i == 0 and not q))
+            else:
+                self.history_row(e, extra[0], extra[1])
+        if start + 6 < len(ops):
+            self.after(12, lambda: self.render_chunk(ops, start + 6, rid))
 
     def day_label(self, dt):
         d = (datetime.now().date() - dt.date()).days
@@ -510,14 +583,14 @@ class App(ctk.CTk):
         row.grid_columnconfigure(1, weight=1)
         ctk.CTkLabel(row, text=e["format"], width=48, height=48, corner_radius=12,
                      fg_color=C["purple"] if e["format"] == "MP4" else C["accent"], text_color="white",
-                     font=ctk.CTkFont(size=12, weight="bold")).grid(row=0, column=0, rowspan=2, padx=12, pady=12)
+                     font=self.font(12, True)).grid(row=0, column=0, rowspan=2, padx=12, pady=12)
         tf = ctk.CTkFrame(row, fg_color="transparent")
         tf.grid(row=0, column=1, sticky="w", pady=(12, 0))
         title = e["title"] if len(e["title"]) <= 52 else e["title"][:51] + "…"
         self.label(tf, title, 13, True, C["text"] if exists else C["muted"]).pack(side="left")
         if latest:
             ctk.CTkLabel(tf, text="LATEST", fg_color=C["green"], text_color="#06281c", corner_radius=6,
-                         height=18, width=52, font=ctk.CTkFont(size=10, weight="bold")).pack(side="left", padx=8)
+                         height=18, width=52, font=self.font(10, True)).pack(side="left", padx=8)
         sub = f"{dt.strftime('%I:%M %p').lstrip('0')}  ·  {fmt_bytes(e.get('size'))}  ·  {e.get('quality', '')}"
         if not exists:
             sub += "  ·  file moved or deleted"
@@ -529,10 +602,10 @@ class App(ctk.CTk):
                  ("Link", lambda: self.copy_link(e["url"]), True)]
         for text, cmd, ok in specs:
             ctk.CTkButton(btns, text=text, width=56, height=30, corner_radius=9, fg_color=C["card2"],
-                          hover_color=C["border"], font=ctk.CTkFont(size=11),
+                          hover_color=C["border"], font=self.font(11),
                           state="normal" if ok else "disabled", command=cmd).pack(side="left", padx=2)
         ctk.CTkButton(btns, text="✕", width=30, height=30, corner_radius=9, fg_color=C["card2"],
-                      hover_color=C["red"], font=ctk.CTkFont(size=11),
+                      hover_color=C["red"], font=self.font(11),
                       command=lambda: self.delete_entry(e)).pack(side="left", padx=2)
 
     def copy_link(self, url):
@@ -569,7 +642,7 @@ class App(ctk.CTk):
         vals = MP4_Q if f == "MP4" else MP3_Q
         self.quality_menu.configure(values=vals)
         saved = self.settings.get(f"quality_{f}")
-        self.quality_var.set(saved if saved in vals else vals[0])
+        self.quality_var.set(saved if saved in vals else (MP3_DEFAULT if f == "MP3" else vals[0]))
         if f == "MP3":
             self.hevc_var.set(False)
         self.hevc_sw.configure(state="normal" if f == "MP4" else "disabled")
@@ -692,16 +765,22 @@ class App(ctk.CTk):
         else:
             self.url_hint.place(x=12, rely=0.5, anchor="w")
 
+    def queue_fit(self, delay=30):
+        if self.fit_job:
+            self.after_cancel(self.fit_job)
+        self.fit_job = self.after(delay, self.fit_title)
+
     def set_title(self, text):
         self.title_full = text
         self.title_lbl.configure(text=text)
-        self.after(10, self.fit_title)
+        self.queue_fit(10)
 
     def set_meta(self, text):
         self.meta_lbl.configure(text=text)
-        self.after(10, self.fit_title)
+        self.queue_fit(10)
 
     def fit_title(self):
+        self.fit_job = None
         text = self.title_full
         avail = self.info_row.winfo_width() - self.meta_lbl.winfo_reqwidth() - 14 - 12
         if avail <= 40 or not text:
@@ -741,16 +820,22 @@ class App(ctk.CTk):
         self.status_lbl.configure(text=text, text_color=text_color)
 
     def tick(self):
+        now = time.perf_counter()
+        dt = min(0.05, now - self.last_tick)
+        self.last_tick = now
         diff = self.target_p - self.shown_p
         if diff:
-            self.shown_p = self.target_p if abs(diff) <= 0.0005 else self.shown_p + diff * 0.18
+            self.shown_p = self.target_p if abs(diff) <= 0.0005 else self.shown_p + diff * (1 - 0.82 ** (dt * 60))
             self.bar.set(max(0, min(1, self.shown_p)))
             self.pct_lbl.configure(text=f"{int(self.shown_p * 100)}%")
         self.after(16, self.tick)
 
     def pulse(self):
+        now = time.perf_counter()
+        dt = min(0.1, now - self.last_pulse)
+        self.last_pulse = now
         if self.busy:
-            self.pulse_t += 0.25
+            self.pulse_t += 6.25 * dt
             k = (math.sin(self.pulse_t) + 1) / 2
             self.dot.configure(text_color=lerp_color(self.active_accent, C["card"], k * 0.8))
         self.after(40, self.pulse)
@@ -767,7 +852,7 @@ class App(ctk.CTk):
             self.after(900, lambda: self.url_entry.configure(border_color=C["border"]))
             self.set_state("error", "Paste a valid YouTube link first")
             return
-        dup = self.find_dup(self.fmt)
+        dup = self.find_dup("M4A" if self.fmt == "MP3" and self.quality_var.get() == M4A_Q else self.fmt)
         if dup:
             when = datetime.fromisoformat(dup["time"]).strftime("%b %d at %I:%M %p")
             if not messagebox.askyesno("Already downloaded",
@@ -806,7 +891,7 @@ class App(ctk.CTk):
                 n = len(d.get("info_dict", {}).get("requested_formats") or []) or 1
                 frac = (done / total) if total else 0
                 p = min(1.0, (stage[0] + frac) / n)
-                self.ui(self._progress, p, done, total, d.get("speed"), d.get("eta"))
+                self.pending_progress = (p, done, total, d.get("speed"), d.get("eta"))
             elif d["status"] == "finished":
                 stage[0] += 1
 
@@ -817,7 +902,10 @@ class App(ctk.CTk):
         opts = {"outtmpl": os.path.join(folder, "%(title)s.%(ext)s"), "noplaylist": True, "quiet": True,
                 "no_warnings": True, "progress_hooks": [hook], "postprocessor_hooks": [pp_hook],
                 "windowsfilenames": True}
-        if fmt == "MP3":
+        original = fmt == "MP3" and q == M4A_Q
+        if original:
+            opts["format"] = "bestaudio[ext=m4a]/bestaudio"
+        elif fmt == "MP3":
             opts["format"] = "bestaudio/best"
             opts["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3",
                                        "preferredquality": re.match(r"\d+", q).group()}]
@@ -834,13 +922,13 @@ class App(ctk.CTk):
                 path = rd[0].get("filepath") if rd else None
                 if not path or not os.path.exists(path):
                     base = os.path.splitext(ydl.prepare_filename(info))[0]
-                    path = base + (".mp3" if fmt == "MP3" else ".mp4")
+                    path = base + (".m4a" if original else ".mp3" if fmt == "MP3" else ".mp4")
             if self.cancel_flag.is_set():
                 raise yt_dlp.utils.DownloadCancelled()
             if fmt == "MP4" and hevc:
                 path = self._to_hevc(path, info.get("duration"))
             entry = {"title": info.get("title", Path(path).stem), "url": url, "vid": info.get("id"),
-                     "format": fmt, "quality": q, "path": os.path.normpath(path),
+                     "format": (Path(path).suffix[1:].upper() or "M4A") if original else fmt, "quality": q, "path": os.path.normpath(path),
                      "size": os.path.getsize(path), "time": datetime.now().isoformat(timespec="seconds")}
             self.ui(self._done, entry)
         except yt_dlp.utils.DownloadCancelled:
@@ -897,7 +985,9 @@ class App(ctk.CTk):
             self.stat["speed"].configure(text=f"{fmt_bytes(speed)}/s · {fmt_dur(eta) if eta else '—'}")
 
     def _done(self, entry):
+        self.pending_progress = None
         self.history.insert(0, entry)
+        del self.history[HISTORY_LIMIT:]
         save_json(HISTORY_FILE, self.history)
         self.last_path = entry["path"]
         self.target_p = 1.0
@@ -909,6 +999,7 @@ class App(ctk.CTk):
         self.stat["left"].configure(text="0 B")
 
     def _failed(self, msg, cancelled):
+        self.pending_progress = None
         self.set_busy(False)
         self.target_p = 0.0
         self.set_state("cancelled" if cancelled else "error", "Download cancelled" if cancelled else msg)
