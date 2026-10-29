@@ -21,12 +21,12 @@ HISTORY_FILE = CONFIG_DIR / "history.json"
 HISTORY_LIMIT = 10
 SETTINGS_FILE = CONFIG_DIR / "settings.json"
 
-C = dict(
-    bg="#0a0c16", card="#11142a", card2="#1a1e3a", border="#252b4d",
-    text="#f1f3fb", muted="#8a90b0", accent="#f97316", accent_h="#fb8b3d",
-    purple="#8b6cff", purple_h="#a18bff", cyan="#22d3ee", green="#34d399",
-    red="#ef4444", red_h="#f87171",
-)
+C = {
+    "bg": "#0a0c16", "card": "#11142a", "card2": "#1a1e3a", "border": "#252b4d",
+    "text": "#f1f3fb", "muted": "#8a90b0", "accent": "#f97316", "accent_h": "#fb8b3d",
+    "purple": "#8b6cff", "purple_h": "#a18bff", "cyan": "#22d3ee", "green": "#34d399",
+    "red": "#ef4444", "red_h": "#f87171",
+}
 
 YT_RE = re.compile(r"(youtube\.com|youtu\.be|music\.youtube\.com)", re.I)
 VID_RE = re.compile(r"(?:v=|youtu\.be/|shorts/|embed/)([\w-]{11})")
