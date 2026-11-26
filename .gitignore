@@ -2,5 +2,8 @@ Music/
 Video/
 Downloads/
 __pycache__/
+build/
 *.pyc
 .freebuff
+web/node_modules/
+web/tsconfig.tsbuildinfo

@@ -1,78 +1,103 @@
 # Streamgrab
 
-A small Windows desktop app for downloading YouTube and YouTube Music links as
-MP4 video or MP3 audio. Built with [customtkinter](https://github.com/TomSchimansky/CustomTkinter)
-and [yt-dlp](https://github.com/yt-dlp/yt-dlp).
+Streamgrab is a Windows desktop app for downloading YouTube and YouTube Music
+links as MP4 video or MP3 audio. The desktop UI is React + Tailwind; FastAPI
+keeps download work in Python and streams progress over Server-Sent Events.
 
 ## Requirements
 
-- Python 3.10 or newer (developed on 3.14; the launchers use `py -3`)
-- `yt-dlp`, `customtkinter` and `Pillow` (see below)
-- FFmpeg on `PATH` — needed for MP3 extraction and for the optional HEVC
-  conversion. Without it, audio downloads and HEVC conversion will fail.
-
-## Install
-
-```bat
-python -m pip install yt-dlp customtkinter pillow
-```
-
-FFmpeg is not a pip package. On Windows the simplest install is:
-
-```bat
-winget install Gyan.FFmpeg
-```
-
-Or download a build from <https://www.gyan.dev/ffmpeg/builds/>, unzip it, and add
-its `bin` folder to your `PATH`. Open a new terminal and check with `ffmpeg -version`.
+- Python 3.10 or newer only for source/debug runs
+- FFmpeg on `PATH` for MP3 extraction and optional HEVC conversion
+- Node.js 20.19+ only when developing or rebuilding the frontend
 
 ## Run
 
-- Double-click **`Run Streamgrab.bat`** — starts the app and keeps a console window
-  open so startup errors stay visible.
-- Double-click **`Streamgrab.vbs`** — starts the app silently, with no console window.
+Double-click **Streamgrab.exe** to launch the app. It bundles Python, the
+backend, and the built web UI; FFmpeg must still be installed and available on
+`PATH`. A second launch exits quietly. The app binds only to `127.0.0.1` on a
+free port and opens in a native window when pywebview is available, otherwise
+it falls back to an Edge or Chrome app window.
 
-Both launchers just run `app.py` from their own folder, so the repo can live anywhere.
+For a source/debug run, install Python packages with
+`python -m pip install -r requirements.txt`, then use **Run Streamgrab.bat**
+to launch with a visible console. **Streamgrab.vbs** remains available as a
+Python-based silent launcher.
 
-## Usage
+To rebuild the executable, install `requirements-build.txt` and double-click
+**Build Streamgrab.exe.bat**. The resulting `Streamgrab.exe` is written next
+to the script. The bundled web assets are committed under `web/dist`, so
+building the executable does not require Node unless the UI source has changed.
 
-1. Paste a YouTube / YouTube Music link into the **Media link** field. Links copied
-   to the clipboard are picked up automatically when the window gains focus.
-2. Pick **MP4 · Video** or **MP3 · Audio**, then a quality. The estimated length and
-   file size appear next to the title.
-3. Choose a save folder and press **Download**. **Cancel** stops the active job.
-4. Press **Add** to stage the current link and paste another — up to 20 links can be
-   queued at once, and the chevron in the preview row expands the per-file list.
-5. The **History** tab lists the last 10 downloads.
+The web bundle is committed under `web/dist`, so end users do not need Node.
+The launchers run from their own directory and the project can be moved freely.
 
-## Data and settings
+## Frontend development
 
-Settings and history are stored as JSON in `~/.streamgrab/`:
+Start a development API in one terminal from the project root:
 
-| File | Contents |
-| --- | --- |
-| `settings.json` | Last folder, format, per-format quality, HEVC toggle |
-| `history.json` | Last 10 downloads (capped on startup) |
+```sh
+python -m uvicorn server:app --host 127.0.0.1 --port 8765
+```
 
-Deleting a history entry or clearing the log never deletes the downloaded files.
+Then from `web/`:
 
-## Files
+```sh
+npm install
+npm run dev
+```
 
-| File | Purpose |
-| --- | --- |
-| `app.py` | The entire application: UI, downloads, history |
-| `Run Streamgrab.bat` | Console launcher |
-| `Streamgrab.vbs` | Silent launcher |
+Vite serves the frontend on port 5173 and proxies `/api` to that development
+server. Create the shipped bundle with:
 
-## Notes
+```sh
+npm run build
+```
 
-- Two downloads run at a time; more than that tends to split bandwidth rather than
-  speed things up.
-- HEVC (H.265) conversion happens after the download and is much slower than the
-  download itself. It requires FFmpeg, and is only offered for MP4.
-- Window size is set in `App.__init__` via `self.geometry("780x680")`.
+The backend serves `web/dist` directly. No Node process is needed after build.
 
-## TODO
+## API examples
 
-- Better visuals
-- Optimization: make the app faster and smoother
+The server prints no console window in the silent launcher. For API development,
+run `python server.py`; its built-in window launcher opens the app. The service
+exposes these local endpoints:
+
+```sh
+curl -X POST http://127.0.0.1:PORT/api/info -H "Content-Type: application/json" \
+  -d '{"urls":["https://www.youtube.com/watch?v=dQw4w9WgXcQ"],"format":"MP3","quality":"128 kbps"}'
+curl -X POST http://127.0.0.1:PORT/api/download -H "Content-Type: application/json" \
+  -d '{"urls":["https://www.youtube.com/watch?v=dQw4w9WgXcQ"],"format":"MP3","quality":"128 kbps","folder":"C:/Users/you/Downloads","hevc":false}'
+curl -N http://127.0.0.1:PORT/api/events
+curl -X POST http://127.0.0.1:PORT/api/cancel
+curl http://127.0.0.1:PORT/api/history
+```
+
+`/api/events` emits JSON snapshots as SSE events while a job changes and sends
+keepalives when idle. The API validates YouTube hosts, formats, qualities,
+configured folder access, and history file actions. It has no generic open-path
+endpoint.
+
+## Features
+
+- MP4 video with Best available, 1080p, 720p, 480p, and 360p caps
+- MP3 at 128, 192, 256, or 320 kbps, or original M4A audio
+- Optional hardware-probed HEVC conversion, with libx265 fallback
+- Up to 20 deduplicated links and two concurrent downloads
+- Duplicate detection by video ID and output format
+- Download history, search, per-format quality settings, and HEVC preference
+- Cancel support and per-file batch state
+
+Settings and the last 10 history entries retain the original JSON formats in
+`~/.streamgrab/settings.json` and `~/.streamgrab/history.json`. Removing
+history never removes the files.
+
+## Project files
+
+- `exe_entry.py` — windowed executable entry point
+- `requirements-build.txt` — PyInstaller build dependency
+- `Build Streamgrab.exe.bat` — rebuilds the standalone executable
+
+- `server.py` — local API, window launcher, and single-instance lock
+- `engine.py` — downloader and persistent settings/history
+- `web/` — Vite, React, TypeScript, and Tailwind sources
+- `web/dist/` — built UI served by FastAPI
+- `legacy/app_tk.py` — original Tk UI retained for reference
