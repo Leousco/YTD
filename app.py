@@ -1,3 +1,4 @@
+import ctypes
 import json
 import math
 import os
@@ -9,6 +10,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
+import tkinter as tk
 from tkinter import filedialog, messagebox
 from tkinter import font as tkfont
 
@@ -30,6 +32,11 @@ C = {
 
 YT_RE = re.compile(r"(youtube\.com|youtu\.be|music\.youtube\.com)", re.I)
 VID_RE = re.compile(r"(?:v=|youtu\.be/|shorts/|embed/)([\w-]{11})")
+URL_RE = re.compile(r"https?://[^\s<>\"']+")
+BATCH_LIMIT = 20      # most links accepted from one paste
+MAX_WORKERS = 2       # simultaneous downloads; more than this thrashes bandwidth
+PREVIEW_ROWS = 6      # rows shown before the batch list starts scrolling
+ROW_H = 34
 MP4_Q = ["Best available", "1080p", "720p", "480p", "360p"]
 M4A_Q = "M4A · Original"
 MP3_Q = [M4A_Q, "128 kbps", "192 kbps", "256 kbps", "320 kbps"]
@@ -55,6 +62,24 @@ def load_json(path, default):
 def save_json(path, data):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def parse_urls(text):
+    """Pull unique YouTube links out of arbitrary pasted text."""
+    urls = []
+    for raw in URL_RE.findall(text or ""):
+        url = raw.rstrip(").,;]}'\"")
+        if url in urls or not YT_RE.search(url):
+            continue
+        urls.append(url)
+        if len(urls) >= BATCH_LIMIT:
+            break
+    return urls
+
+
+def vid_of(url):
+    m = VID_RE.search(url or "")
+    return m.group(1) if m else None
 
 
 def fmt_bytes(n):
@@ -226,22 +251,99 @@ def search_image(px=72, color="#8a90b0"):
     return img.resize((px, px), Image.LANCZOS)
 
 
-FONT_CANDIDATES = {
-    "win32": ["Segoe UI"],
-    "darwin": ["SF Pro Text", "Helvetica Neue"],
+FONT_STACKS = {
+    "win32": [("Segoe UI", "Segoe UI Semibold"), ("Calibri", "Calibri")],
+    "darwin": [("SF Pro Text", "SF Pro Text"), ("Helvetica Neue", "Helvetica Neue")],
 }
-FONT_CANDIDATES_DEFAULT = ["Inter", "Noto Sans", "Ubuntu", "Cantarell", "DejaVu Sans"]
+FONT_STACKS_DEFAULT = [("Inter", "Inter"), ("Noto Sans", "Noto Sans"),
+                       ("Cantarell", "Cantarell"), ("Ubuntu", "Ubuntu"), ("DejaVu Sans", "DejaVu Sans")]
+
+
+def pick_fonts(root):
+    """Prefer a UI family that ships a real semibold face.
+
+    Tk fakes bold by smearing the weight normal face, which is what makes
+    small labels look chunky and pixelated. Using an actual semibold family
+    keeps emphasis crisp at 10-11px.
+    """
+    installed = set(tkfont.families(root))
+    for body, semibold in FONT_STACKS.get(sys.platform, FONT_STACKS_DEFAULT):
+        if body in installed:
+            return body, (semibold if semibold in installed else None)
+    return "TkDefaultFont", None
+
+
+def clear_layered_style(window):
+    """Drop WS_EX_LAYERED after the fade so Windows re-enables ClearType.
+
+    Tk's -alpha attribute makes the toplevel a layered window, and subpixel
+    text antialiasing is disabled on layered surfaces, so text stays soft
+    even at alpha 1.0.
+    """
+    if sys.platform != "win32":
+        return
+    GWL_EXSTYLE = -20
+    WS_EX_LAYERED = 0x00080000
+    SWP = 0x0001 | 0x0002 | 0x0004 | 0x0020
+    try:
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetParent(window.winfo_id()) or window.winfo_id()
+        style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        if style & WS_EX_LAYERED:
+            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style & ~WS_EX_LAYERED)
+            user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, SWP)
+    except Exception:
+        pass
+
+
+class SmoothBar(tk.Canvas):
+    """Pill progress bar drawn as two canvas lines.
+
+    A frame update is a single coords() call instead of the full canvas
+    re-draw a CTkProgressBar does on every set().
+    """
+
+    def __init__(self, parent, height=8, track="#1a1e3a", accent="#f97316", bg="#11142a"):
+        super().__init__(parent, height=height, highlightthickness=0, bd=0, bg=bg)
+        self._h = height
+        self._p = -1.0
+        self._track = self.create_line(0, 0, 1, 0, width=height, capstyle="round", fill=track)
+        self._fill = self.create_line(0, 0, 1, 0, width=height, capstyle="round", fill=accent,
+                                      state="hidden")
+        self.bind("<Configure>", lambda e: self._draw())
+
+    def set(self, p):
+        p = 0.0 if p < 0 else (1.0 if p > 1 else float(p))
+        if abs(p - self._p) < 0.0008:
+            return
+        self._p = p
+        self._draw()
+
+    def set_color(self, color):
+        self.itemconfigure(self._fill, fill=color)
+
+    def _draw(self):
+        w = self.winfo_width()
+        if w <= 1:
+            return
+        y = r = self._h / 2
+        self.coords(self._track, r, y, w - r, y)
+        if self._p <= 0.001:
+            self.itemconfigure(self._fill, state="hidden")
+            return
+        self.itemconfigure(self._fill, state="normal")
+        self.coords(self._fill, r, y, max(r + 0.5, r + (w - self._h) * self._p), y)
 
 
 class App(ctk.CTk):
+    FRAME_MS = 16
+    IDLE_MS = 60
+
     def __init__(self):
         super().__init__()
         ctk.set_appearance_mode("dark")
-        installed = set(tkfont.families(self))
-        for name in FONT_CANDIDATES.get(sys.platform, FONT_CANDIDATES_DEFAULT):
-            if name in installed:
-                ctk.ThemeManager.theme["CTkFont"]["family"] = name
-                break
+        self.font_family, self.font_semibold = pick_fonts(self)
+        ctk.ThemeManager.theme["CTkFont"]["family"] = self.font_family
         self.title("Streamgrab")
         self.geometry("780x680")
         self.minsize(640, 560)
@@ -254,9 +356,19 @@ class App(ctk.CTk):
             save_json(HISTORY_FILE, self.history)
         self.ui_q = queue.Queue()
         self.cancel_flag = threading.Event()
-        self.proc = None
+        self.procs = set()
         self.busy = False
         self.info = None
+        self.batch_urls = []
+        self.field_urls = []
+        self.urls = []
+        self.batch_infos = {}
+        self.batch_status = {}
+        self.batch_rows = []
+        self.batch_open = False
+        self.job = None
+        self._urls_sig = None
+        self._batch_sig = None
         self.fetch_id = 0
         self.deb = None
         self.last_clip = ""
@@ -264,6 +376,10 @@ class App(ctk.CTk):
         self.target_p = 0.0
         self.shown_p = 0.0
         self.pulse_t = 0.0
+        self._pulse_acc = 0.0
+        self._pct = -1
+        self._state_key = None
+        self._frame_job = None
         self.dot_color = C["green"]
         self.active_accent = C["accent"]
         self.fmt = self.settings.get("format", "MP3")
@@ -282,7 +398,6 @@ class App(ctk.CTk):
         self.fit_job = None
         self.pending_progress = None
         self.last_tick = time.perf_counter()
-        self.last_pulse = time.perf_counter()
         self.icon_note = ctk.CTkImage(note_image(96), size=(48, 48))
         self.icon_play = ctk.CTkImage(play_image(96), size=(48, 48))
         self.icon_search = ctk.CTkImage(search_image(72), size=(18, 18))
@@ -295,42 +410,98 @@ class App(ctk.CTk):
 
         self.bind("<FocusIn>", self.on_focus)
         self.bind("<Return>", lambda e: self.fetch_info() if self.focus_get() else None)
-        self.after(30, self.poll)
-        self.tick()
-        self.pulse()
+        self.after(self.FRAME_MS, self._frame)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.attributes("-alpha", 0.0)
         self.fade_in()
+        if self.hevc_var.get():
+            threading.Thread(target=hevc_encoders, daemon=True).start()
 
     def fade_in(self, t0=None):
         t0 = t0 or time.perf_counter()
-        a = min(1.0, (time.perf_counter() - t0) / 0.22)
+        a = min(1.0, (time.perf_counter() - t0) / 0.18)
         self.attributes("-alpha", a)
         if a < 1.0:
             self.after(10, lambda: self.fade_in(t0))
+        else:
+            clear_layered_style(self)
 
     def ui(self, fn, *args):
         self.ui_q.put((fn, args))
 
-    def poll(self):
+    def _frame(self):
+        """Single update clock for the whole app.
+
+        Runs at FRAME_MS while something is animating and backs off to IDLE_MS
+        when idle, so a quiet window costs ~16 wakeups a second instead of the
+        ~120 the old poll/tick/pulse loops were spending.
+        """
+        self._frame_job = None
+        now = time.perf_counter()
+        dt = min(0.05, now - self.last_tick)
+        self.last_tick = now
+        active = False
+
         pp = self.pending_progress
         if pp is not None:
             self.pending_progress = None
             self._progress(*pp)
+            active = True
+
         try:
             while True:
                 fn, args = self.ui_q.get_nowait()
                 fn(*args)
+                active = True
         except queue.Empty:
             pass
-        self.after(30, self.poll)
+
+        diff = self.target_p - self.shown_p
+        if diff:
+            if abs(diff) <= 0.0006:
+                self.shown_p = self.target_p
+            else:
+                self.shown_p += diff * (1 - 0.82 ** (dt * 60))
+                active = True
+            self._paint_progress()
+
+        if self.busy:
+            active = True
+            self.pulse_t += 6.25 * dt
+            self._pulse_acc += dt
+            if self._pulse_acc >= 0.04:
+                self._pulse_acc = 0.0
+                k = (math.sin(self.pulse_t) + 1) / 2
+                self.dot.configure(text_color=lerp_color(self.active_accent, C["card"], k * 0.8))
+
+        self._frame_job = self.after(self.FRAME_MS if active else self.IDLE_MS, self._frame)
+
+    def _paint_progress(self):
+        p = self.shown_p
+        p = 0.0 if p < 0 else (1.0 if p > 1 else p)
+        self.bar.set(p)
+        pct = int(p * 100)
+        if pct != self._pct:
+            self._pct = pct
+            self.pct_lbl.configure(text=f"{pct}%")
 
     def font(self, size, bold=False):
         key = (size, bold)
         f = self.font_cache.get(key)
         if f is None:
-            f = self.font_cache[key] = ctk.CTkFont(size=size, weight="bold" if bold else "normal")
+            if bold and self.font_semibold:
+                f = ctk.CTkFont(family=self.font_semibold, size=size)
+            else:
+                f = ctk.CTkFont(family=self.font_family, size=size,
+                                weight="bold" if bold else "normal")
+            self.font_cache[key] = f
         return f
+
+    def _set_text(self, widget, text):
+        """Skip redundant configure() calls, which cost a full redraw each."""
+        if widget.cget("text") == text:
+            return
+        widget.configure(text=text)
 
     def label(self, parent, text, size=12, bold=False, color=None, **kw):
         return ctk.CTkLabel(parent, text=text, text_color=color or C["text"],
@@ -355,7 +526,7 @@ class App(ctk.CTk):
             head, values=["Download", "History"], command=self.show_page, height=36,
             fg_color=C["card"], selected_color=C["accent"], selected_hover_color=C["accent_h"],
             unselected_color=C["card"], unselected_hover_color=C["card2"], corner_radius=12,
-            font=ctk.CTkFont(size=13, weight="bold"))
+            font=self.font(13, True))
         self.tabs.pack(side="right")
         self.tabs.set("Download")
         self.pages = ctk.CTkFrame(self, fg_color="transparent")
@@ -376,7 +547,7 @@ class App(ctk.CTk):
 
         link = self.card(pg)
         link.pack(fill="x")
-        self.label(link, "MEDIA LINK", 10, True, C["muted"]).pack(anchor="w", padx=16, pady=(12, 5))
+        self.label(link, "MEDIA LINK", 11, True, C["muted"]).pack(anchor="w", padx=16, pady=(12, 5))
         row = ctk.CTkFrame(link, fg_color="transparent")
         row.pack(fill="x", padx=20)
         self.url_entry = ctk.CTkEntry(row, textvariable=self.url_var, height=38, corner_radius=11,
@@ -388,24 +559,44 @@ class App(ctk.CTk):
                              fg_color="transparent", font=ctk.CTkFont(size=13), height=20)
         self.url_hint.place(x=12, rely=0.5, anchor="w")
         self.url_hint.bind("<Button-1>", lambda e: self.url_entry.focus_set())
-        self.url_var.trace_add("write", lambda *_: self.sync_url_hint())
-        for text, cmd in (("Paste", self.paste), ("Clear", self.clear)):
-            ctk.CTkButton(row, text=text, width=68, height=38, corner_radius=11, fg_color=C["card2"],
-                          hover_color=C["border"], border_width=1, border_color=C["border"],
-                          command=cmd).pack(side="left", padx=(8, 0))
+        for text, cmd in (("Paste", self.paste), ("Add", self.add_to_batch), ("Clear", self.clear)):
+            btn = ctk.CTkButton(row, text=text, width=58 if text == "Add" else 68, height=38,
+                                corner_radius=11, fg_color=C["card2"], hover_color=C["border"],
+                                border_width=1, border_color=C["border"], command=cmd)
+            btn.pack(side="left", padx=(8, 0))
+            if text == "Add":
+                self.add_btn = btn
+        self._sync_add_btn()
 
-        self.preview = ctk.CTkFrame(link, fg_color=C["card2"], corner_radius=12, height=42)
+        self.preview = ctk.CTkFrame(link, fg_color=C["card2"], corner_radius=12)
         self.preview.pack(fill="x", padx=16, pady=(10, 12))
-        self.preview.pack_propagate(False)
-        self.info_row = ctk.CTkFrame(self.preview, fg_color="transparent")
-        self.info_row.pack(fill="both", expand=True, padx=14)
+        self.info_row = ctk.CTkFrame(self.preview, fg_color="transparent", height=42)
+        # inset by more than the preview's corner radius, otherwise this child
+        # paints its background straight over the rounded corners
+        self.info_row.pack(fill="x", padx=14)
+        self.info_row.pack_propagate(False)
         self.title_lbl = self.label(self.info_row, "Paste a link to get started", 12, True, anchor="w")
         self.title_lbl.pack(side="left")
         self.meta_lbl = self.label(self.info_row, "Length and estimated size will show here", 12,
                                    color=C["cyan"], anchor="w")
         self.meta_lbl.pack(side="left", padx=(14, 0))
+        self.info_right = ctk.CTkFrame(self.info_row, fg_color="transparent")
+        self.chevron = ctk.CTkButton(self.info_right, text="▾", width=26, height=26, corner_radius=8,
+                                     fg_color="transparent", hover_color=C["border"],
+                                     text_color=C["muted"], font=self.font(13, True),
+                                     command=self.toggle_batch)
+        self.chevron.pack()
+        self._chev_shown = False
+        self._batch_shown = False
         self.title_full = "Paste a link to get started"
         self.info_row.bind("<Configure>", lambda e: self.queue_fit())
+
+        self.batch_box = ctk.CTkFrame(self.preview, fg_color="transparent")
+        self.batch_scroll = ctk.CTkScrollableFrame(
+            self.batch_box, fg_color="transparent", height=ROW_H * PREVIEW_ROWS,
+            scrollbar_fg_color=C["card2"], scrollbar_button_color="#69749a",
+            scrollbar_button_hover_color="#aab5dc")
+        self.batch_scroll.pack(fill="both", expand=True)
 
         opts = self.card(pg)
         opts.pack(fill="x", pady=9)
@@ -431,7 +622,7 @@ class App(ctk.CTk):
             dropdown_fg_color=C["card2"], dropdown_hover_color=C["border"], command=lambda _: self.after_quality())
         self.quality_menu.pack()
 
-        self.label(opts, "SAVE TO", 10, True, C["muted"]).pack(anchor="w", padx=16, pady=(11, 5))
+        self.label(opts, "SAVE TO", 11, True, C["muted"]).pack(anchor="w", padx=16, pady=(11, 5))
         sr = ctk.CTkFrame(opts, fg_color="transparent")
         sr.pack(fill="x", padx=20)
         ctk.CTkEntry(sr, textvariable=self.folder_var, height=36, corner_radius=10, fg_color=C["card2"],
@@ -452,12 +643,12 @@ class App(ctk.CTk):
         act.pack(fill="x")
         act.grid_columnconfigure((0, 1), weight=1, uniform="a")
         self.dl_btn = ctk.CTkButton(act, text="Download", height=44, corner_radius=12, fg_color=C["accent"],
-                                    hover_color=C["accent_h"], font=ctk.CTkFont(size=15, weight="bold"),
+                                    hover_color=C["accent_h"], font=self.font(15, True),
                                     command=self.start_download)
         self.dl_btn.grid(row=0, column=0, sticky="ew", padx=(0, 6))
         self.cancel_btn = ctk.CTkButton(act, text="Cancel", height=44, corner_radius=12, fg_color="#2a1f2e",
                                         hover_color=C["red_h"], text_color_disabled="#5a4a5e", state="disabled",
-                                        font=ctk.CTkFont(size=15, weight="bold"), command=self.cancel)
+                                        font=self.font(15, True), command=self.cancel)
         self.cancel_btn.grid(row=0, column=1, sticky="ew", padx=(6, 0))
 
         prog = self.card(pg)
@@ -466,7 +657,7 @@ class App(ctk.CTk):
         sr.pack(fill="x", padx=16, pady=(11, 6))
         self.dot = ctk.CTkLabel(sr, text="●", text_color=C["green"], font=ctk.CTkFont(size=14))
         self.dot.pack(side="left")
-        self.status_lbl = self.label(sr, "Ready", 14, True, anchor="w")
+        self.status_lbl = self.label(sr, "Ready", 15, True, anchor="w")
         self.status_lbl.pack(side="left", padx=8)
         self.pct_lbl = self.label(sr, "0%", 13, True, C["cyan"])
         self.pct_lbl.pack(side="right")
@@ -474,9 +665,7 @@ class App(ctk.CTk):
                                       fg_color=C["card2"], hover_color=C["border"], state="disabled",
                                       command=lambda: self.last_path and reveal(self.last_path))
         self.show_btn.pack(side="right", padx=12)
-        self.bar = ctk.CTkProgressBar(prog, height=8, corner_radius=4, fg_color=C["card2"],
-                                      progress_color=C["accent"])
-        self.bar.set(0)
+        self.bar = SmoothBar(prog, height=8, track=C["card2"], accent=C["accent"], bg=C["card"])
         self.bar.pack(fill="x", padx=16)
         stats = ctk.CTkFrame(prog, fg_color="transparent")
         stats.pack(fill="x", padx=11, pady=(10, 12))
@@ -491,10 +680,10 @@ class App(ctk.CTk):
             ctk.CTkFrame(box, width=3, height=2, fg_color=col, corner_radius=2).pack(side="left", fill="y", padx=(10, 0), pady=9)
             inner = ctk.CTkFrame(box, fg_color="transparent")
             inner.pack(side="left", padx=8, pady=9)
-            self.label(inner, title, 9, True, C["muted"], height=14).pack(anchor="w")
+            self.label(inner, title, 10, True, C["muted"], height=15).pack(anchor="w")
             v = self.label(inner, "—", 15, True, height=20)
             v.pack(anchor="w")
-            v.configure(font=ctk.CTkFont(size=13, weight="bold"))
+            v.configure(font=self.font(14, True))
             self.stat[key] = v
 
     def build_history_page(self):
@@ -519,6 +708,7 @@ class App(ctk.CTk):
             pg, fg_color="transparent", scrollbar_fg_color=C["card"],
             scrollbar_button_color="#69749a", scrollbar_button_hover_color="#aab5dc")
         self.hist_list.pack(fill="both", expand=True)
+        self._slots = []
 
     def schedule_search(self):
         if self.search_job:
@@ -536,36 +726,160 @@ class App(ctk.CTk):
             return
         self.hist_sig = sig
         self.render_id += 1
-        rid = self.render_id
-        for w in self.hist_list.winfo_children():
-            w.destroy()
-        self.count_lbl.configure(text=f"{len(items)} download{'s' if len(items) != 1 else ''}, newest first")
-        if not items:
-            self.label(self.hist_list, "Nothing here yet. Your downloads will appear in this list.", 13,
-                       color=C["muted"]).pack(pady=60)
-            return
+        self._set_text(self.count_lbl,
+                       f"{len(items)} download{'s' if len(items) != 1 else ''}, newest first")
         ops = []
         last_day = None
         for i, e in enumerate(shown):
             dt = datetime.fromisoformat(e["time"])
             day = self.day_label(dt)
             if day != last_day:
-                ops.append((day, None, None))
+                ops.append(("day", day, None, False))
                 last_day = day
-            ops.append((None, e, (dt, i == 0 and not q)))
-        self.render_chunk(ops, 0, rid)
+            ops.append(("row", e, dt, i == 0 and not q))
+        if not ops:
+            ops.append(("empty", None, None, False))
+        self._sync_slots(ops, self.render_id, 0)
 
-    def render_chunk(self, ops, start, rid):
+    def _sync_slots(self, ops, rid, start):
+        """Reconcile the list in place: reuse row widgets, only update props.
+
+        The old version destroyed and rebuilt every child on each render, which
+        reconstructed ~10 widgets per row on every search keystroke.
+        """
         if rid != self.render_id:
             return
-        for day, e, extra in ops[start:start + 6]:
-            if e is None:
-                self.label(self.hist_list, day.upper(), 11, True, C["muted"], anchor="w").pack(
-                    anchor="w", pady=(10, 2), padx=4)
+        end = min(len(ops), start + 8)
+        for i in range(start, end):
+            kind, payload, dt, latest = ops[i]
+            slot = self._slots[i] if i < len(self._slots) else None
+            if slot is None or slot["kind"] != kind:
+                if slot is not None:
+                    slot["w"].destroy()
+                slot = self._build_slot(kind)
+                if i < len(self._slots):
+                    self._slots[i] = slot
+                else:
+                    self._slots.append(slot)
+            self._fill_slot(slot, payload, dt, latest)
+            if not slot["packed"]:
+                self._pack_slot(i)
+        if end < len(ops):
+            self.after(1, lambda: self._sync_slots(ops, rid, end))
+            return
+        for i in range(end, len(self._slots)):
+            slot = self._slots[i]
+            if slot["packed"]:
+                slot["w"].pack_forget()
+                slot["packed"] = False
+
+    def _pack_slot(self, i):
+        slot = self._slots[i]
+        anchor = None
+        for j in range(i + 1, len(self._slots)):
+            if self._slots[j]["packed"]:
+                anchor = self._slots[j]["w"]
+                break
+        if slot["kind"] == "day":
+            kw = {"anchor": "w", "pady": (10, 2), "padx": 4}
+        elif slot["kind"] == "row":
+            kw = {"fill": "x", "pady": 4, "padx": 2}
+        else:
+            kw = {"pady": 60}
+        if anchor is not None:
+            kw["before"] = anchor
+        slot["w"].pack(**kw)
+        slot["packed"] = True
+
+    def _build_slot(self, kind):
+        if kind == "day":
+            w = self.label(self.hist_list, "", 11, True, C["muted"], anchor="w")
+            return {"kind": "day", "w": w, "packed": False, "cache": {}}
+        if kind == "empty":
+            w = self.label(self.hist_list, "Nothing here yet. Your downloads will appear in this list.",
+                           13, color=C["muted"])
+            return {"kind": "empty", "w": w, "packed": False, "cache": {}}
+        w = ctk.CTkFrame(self.hist_list, fg_color=C["card"], corner_radius=14, border_width=1,
+                         border_color=C["border"])
+        w.grid_columnconfigure(1, weight=1)
+        badge = ctk.CTkLabel(w, text="", width=48, height=48, corner_radius=12, fg_color=C["accent"],
+                             text_color="white", font=self.font(12, True))
+        badge.grid(row=0, column=0, rowspan=2, padx=12, pady=12)
+        tf = ctk.CTkFrame(w, fg_color="transparent")
+        tf.grid(row=0, column=1, sticky="w", pady=(12, 0))
+        title = self.label(tf, "", 13, True, anchor="w")
+        title.pack(side="left")
+        pill = ctk.CTkLabel(tf, text="LATEST", fg_color=C["green"], text_color="#06281c",
+                            corner_radius=6, height=18, width=52, font=self.font(10, True))
+        sub = self.label(w, "", 11, color=C["muted"])
+        sub.grid(row=1, column=1, sticky="w", pady=(0, 12))
+        btns = ctk.CTkFrame(w, fg_color="transparent")
+        btns.grid(row=0, column=2, rowspan=2, padx=10)
+        ref = {"kind": "row", "w": w, "packed": False, "cache": {}, "entry": None,
+               "badge": badge, "title": title, "pill": pill, "pill_on": False, "sub": sub,
+               "btns": []}
+        for text, action, needs_file in (("Open", "open", True), ("Folder", "folder", True),
+                                         ("Link", "link", False)):
+            b = ctk.CTkButton(btns, text=text, width=56, height=30, corner_radius=9,
+                              fg_color=C["card2"], hover_color=C["border"], font=self.font(11),
+                              command=lambda a=action, r=ref: self._row_action(a, r))
+            b.pack(side="left", padx=2)
+            ref["btns"].append((b, needs_file))
+        ctk.CTkButton(btns, text="✕", width=30, height=30, corner_radius=9, fg_color=C["card2"],
+                      hover_color=C["red"], font=self.font(11),
+                      command=lambda r=ref: self._row_action("delete", r)).pack(side="left", padx=2)
+        return ref
+
+    def _cfg(self, widget, cache, key, **kw):
+        if cache.get(key) == kw:
+            return
+        cache[key] = kw
+        widget.configure(**kw)
+
+    def _fill_slot(self, slot, payload, dt, latest):
+        kind = slot["kind"]
+        if kind == "empty":
+            return
+        cache = slot["cache"]
+        if kind == "day":
+            self._cfg(slot["w"], cache, "text", text=payload.upper())
+            return
+        e = payload
+        slot["entry"] = e
+        exists = os.path.exists(e["path"])
+        title = e["title"] if len(e["title"]) <= 52 else e["title"][:51] + "…"
+        self._cfg(slot["badge"], cache, "badge", text=e["format"],
+                  fg_color=C["purple"] if e["format"] == "MP4" else C["accent"])
+        self._cfg(slot["title"], cache, "title", text=title,
+                  text_color=C["text"] if exists else C["muted"])
+        self._cfg(slot["w"], cache, "border", border_color=C["green"] if latest else C["border"])
+        sub = (f"{dt.strftime('%I:%M %p').lstrip('0')}  ·  {fmt_bytes(e.get('size'))}  ·  "
+               f"{e.get('quality', '')}")
+        if not exists:
+            sub += "  ·  file moved or deleted"
+        self._cfg(slot["sub"], cache, "sub", text=sub,
+                  text_color=C["red_h"] if not exists else C["muted"])
+        if latest != slot["pill_on"]:
+            slot["pill_on"] = latest
+            if latest:
+                slot["pill"].pack(side="left", padx=8)
             else:
-                self.history_row(e, extra[0], extra[1])
-        if start + 6 < len(ops):
-            self.after(12, lambda: self.render_chunk(ops, start + 6, rid))
+                slot["pill"].pack_forget()
+        for button, needs_file in slot["btns"]:
+            button.configure(state="normal" if (exists or not needs_file) else "disabled")
+
+    def _row_action(self, action, ref):
+        e = ref["entry"]
+        if not e:
+            return
+        if action == "open":
+            open_path(e["path"])
+        elif action == "folder":
+            reveal(e["path"])
+        elif action == "link":
+            self.copy_link(e["url"])
+        else:
+            self.delete_entry(e)
 
     def day_label(self, dt):
         d = (datetime.now().date() - dt.date()).days
@@ -574,39 +888,6 @@ class App(ctk.CTk):
         if d == 1:
             return "Yesterday"
         return dt.strftime("%a, %b %d, %Y")
-
-    def history_row(self, e, dt, latest):
-        exists = os.path.exists(e["path"])
-        row = ctk.CTkFrame(self.hist_list, fg_color=C["card"], corner_radius=14, border_width=1,
-                           border_color=C["green"] if latest else C["border"])
-        row.pack(fill="x", pady=4, padx=2)
-        row.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(row, text=e["format"], width=48, height=48, corner_radius=12,
-                     fg_color=C["purple"] if e["format"] == "MP4" else C["accent"], text_color="white",
-                     font=self.font(12, True)).grid(row=0, column=0, rowspan=2, padx=12, pady=12)
-        tf = ctk.CTkFrame(row, fg_color="transparent")
-        tf.grid(row=0, column=1, sticky="w", pady=(12, 0))
-        title = e["title"] if len(e["title"]) <= 52 else e["title"][:51] + "…"
-        self.label(tf, title, 13, True, C["text"] if exists else C["muted"]).pack(side="left")
-        if latest:
-            ctk.CTkLabel(tf, text="LATEST", fg_color=C["green"], text_color="#06281c", corner_radius=6,
-                         height=18, width=52, font=self.font(10, True)).pack(side="left", padx=8)
-        sub = f"{dt.strftime('%I:%M %p').lstrip('0')}  ·  {fmt_bytes(e.get('size'))}  ·  {e.get('quality', '')}"
-        if not exists:
-            sub += "  ·  file moved or deleted"
-        self.label(row, sub, 11, color=C["red_h"] if not exists else C["muted"]).grid(
-            row=1, column=1, sticky="w", pady=(0, 12))
-        btns = ctk.CTkFrame(row, fg_color="transparent")
-        btns.grid(row=0, column=2, rowspan=2, padx=10)
-        specs = [("Open", lambda: open_path(e["path"]), exists), ("Folder", lambda: reveal(e["path"]), exists),
-                 ("Link", lambda: self.copy_link(e["url"]), True)]
-        for text, cmd, ok in specs:
-            ctk.CTkButton(btns, text=text, width=56, height=30, corner_radius=9, fg_color=C["card2"],
-                          hover_color=C["border"], font=self.font(11),
-                          state="normal" if ok else "disabled", command=cmd).pack(side="left", padx=2)
-        ctk.CTkButton(btns, text="✕", width=30, height=30, corner_radius=9, fg_color=C["card2"],
-                      hover_color=C["red"], font=self.font(11),
-                      command=lambda: self.delete_entry(e)).pack(side="left", padx=2)
 
     def copy_link(self, url):
         self.clipboard_clear()
@@ -632,7 +913,7 @@ class App(ctk.CTk):
         self.logo.configure(image=self.icon_play if f == "MP4" else self.icon_note, fg_color=accent)
         self.tabs.configure(selected_color=accent, selected_hover_color=accent_hover)
         self.dl_btn.configure(fg_color=accent, hover_color=accent_hover)
-        self.bar.configure(progress_color=accent)
+        self.bar.set_color(accent)
         for k, b in self.fmt_btns.items():
             on = k == f
             col = C["purple"] if k == "MP4" else C["accent"]
@@ -678,8 +959,15 @@ class App(ctk.CTk):
 
     def clear(self):
         self.url_var.set("")
+        self.batch_urls = []
+        self.field_urls = []
+        self._refresh_urls()
+        self._urls_sig = None
         self.fetch_id += 1
         self.info = None
+        self._reset_batch()
+        self._apply_batch_layout()
+        self._sync_add_btn()
         self.set_title("Paste a link to get started")
         self.set_meta("Length and estimated size will show here")
         if self.deb:
@@ -705,31 +993,85 @@ class App(ctk.CTk):
             self.last_clip = clip
             self.url_var.set(clip)
 
-    def animate_height(self, widget, target):
-        cur = widget.cget("height")
-        if abs(cur - target) <= 2:
-            widget.configure(height=target)
-            return
-        widget.configure(height=int(cur + (target - cur) * 0.35))
-        self.after(16, lambda: self.animate_height(widget, target))
-
     def on_url_change(self, *_):
+        self.sync_url_hint()
+        self.field_urls = parse_urls(self.url_var.get())
+        self._sync_add_btn()
         if self.deb:
             self.after_cancel(self.deb)
         self.deb = self.after(450, self.fetch_info)
 
     def fetch_info(self):
-        url = self.url_var.get().strip()
+        text = self.url_var.get().strip()
+        self.field_urls = parse_urls(text)
+        self._refresh_urls()
+        sig = tuple(self.urls)
+        if sig == self._urls_sig:
+            self._sync_add_btn()
+            return
+        self._urls_sig = sig
         self.fetch_id += 1
         fid = self.fetch_id
         self.info = None
-        if not YT_RE.search(url):
-            self.set_title("Paste a link to get started" if not url else "That doesn't look like a YouTube link")
+        self._reset_batch()
+        if not self.urls:
+            self.set_title("Paste a link to get started" if not text else "That doesn't look like a YouTube link")
             self.set_meta("Length and estimated size will show here")
+            self._apply_batch_layout()
+            self._sync_add_btn()
             return
-        self.set_title("Fetching details…")
-        self.set_meta("")
-        threading.Thread(target=self._fetch, args=(url, fid), daemon=True).start()
+        if len(self.urls) == 1:
+            self.set_title("Fetching details…")
+            self.set_meta("")
+            threading.Thread(target=self._fetch, args=(self.urls[0], fid), daemon=True).start()
+        else:
+            self.refresh_preview_meta()
+            missing = [u for u in self.urls if u not in self.batch_infos]
+            if missing:
+                threading.Thread(target=self._fetch_batch, args=(fid, missing), daemon=True).start()
+        self._apply_batch_layout()
+        self._sync_add_btn()
+
+    def add_to_batch(self):
+        """Commit the link in the field into the batch, then clear the field."""
+        if self.busy:
+            return
+        parsed = parse_urls(self.url_var.get())
+        if not parsed:
+            self.url_entry.configure(border_color=C["red"])
+            self.after(900, lambda: self.url_entry.configure(border_color=C["border"]))
+            self.set_state("error", "Paste a valid YouTube link first")
+            return
+        fresh = [u for u in parsed if u not in self.batch_urls]
+        if not fresh:
+            self.set_state("error", "That link is already in the batch")
+            return
+        room = BATCH_LIMIT - len(self.batch_urls)
+        if room <= 0:
+            self.set_state("error", f"Batch is full ({BATCH_LIMIT} links)")
+            return
+        added = fresh[:room]
+        self.batch_urls.extend(added)
+        self.url_var.set("")
+        self.field_urls = []
+        self._refresh_urls()
+        self.fetch_id += 1
+        fid = self.fetch_id
+        self._urls_sig = tuple(self.urls)
+        self._reset_batch()
+        if len(self.urls) == 1:
+            self.set_title("Fetching details…")
+            self.set_meta("")
+            threading.Thread(target=self._fetch, args=(self.urls[0], fid), daemon=True).start()
+        else:
+            self.refresh_preview_meta()
+            missing = [u for u in added if u not in self.batch_infos]
+            if missing:
+                threading.Thread(target=self._fetch_batch, args=(fid, missing), daemon=True).start()
+        self._apply_batch_layout()
+        self._sync_add_btn()
+        self.set_state("ready", f"Added · {len(self.urls)} in batch")
+        self.url_entry.focus_set()
 
     def _fetch(self, url, fid):
         try:
@@ -748,16 +1090,172 @@ class App(ctk.CTk):
             self.set_meta("Check the URL and your connection")
             return
         self.info = info
+        if len(self.urls) == 1:
+            self.batch_infos[self.urls[0]] = info
         t = info.get("title", "Untitled")
         self.set_title(t)
         self.refresh_preview_meta()
 
+    def _fetch_batch(self, fid, urls):
+        """Read details for a batch, three at a time so we don't hammer YouTube."""
+        gate = threading.Semaphore(3)
+
+        def one(url):
+            with gate:
+                if fid != self.fetch_id or self.cancel_flag.is_set():
+                    return
+                try:
+                    with yt_dlp.YoutubeDL({"quiet": True, "noplaylist": True, "skip_download": True,
+                                           "no_warnings": True}) as ydl:
+                        info = ydl.extract_info(url, download=False)
+                except Exception:
+                    info = None
+                self.ui(self._batch_fetched, fid, url, info)
+
+        for url in urls:
+            threading.Thread(target=one, args=(url,), daemon=True).start()
+
+    def _batch_fetched(self, fid, url, info):
+        if fid != self.fetch_id:
+            return
+        if info:
+            self.batch_infos[url] = info
+        if url in self.urls:
+            self._fill_batch_row(self.urls.index(url))
+        self.refresh_preview_meta()
+
     def refresh_preview_meta(self):
+        n = len(self.urls)
+        if n > 1:
+            known = [self.batch_infos[u] for u in self.urls if u in self.batch_infos]
+            dur = sum(i.get("duration") or 0 for i in known)
+            size = sum(estimate_size(i, self.fmt, self.quality_var.get()) or 0 for i in known)
+            parts = []
+            if dur:
+                parts.append(fmt_dur(dur))
+            if size:
+                parts.append(f"~ {fmt_bytes(size)}")
+            if len(known) < n:
+                parts.append(f"reading {len(known)}/{n}…")
+            self.set_title(f"{n} Files")
+            self.set_meta("  ·  ".join(parts) if parts else "Reading details…")
+            if self.batch_rows:
+                self._render_batch_list()
+            return
         if not self.info:
             return
         size = estimate_size(self.info, self.fmt, self.quality_var.get())
         parts = [fmt_dur(self.info.get("duration")), f"~ {fmt_bytes(size)}" if size else ""]
         self.set_meta("  ·  ".join(p for p in parts if p))
+
+    def _refresh_urls(self):
+        """The list is the committed batch plus whatever is staged in the field."""
+        combined = list(self.batch_urls)
+        for url in self.field_urls:
+            if url not in combined:
+                combined.append(url)
+        self.urls = combined
+
+    def _reset_batch(self):
+        self.batch_infos = {u: self.batch_infos[u] for u in self.urls if u in self.batch_infos}
+        self.batch_status = {}
+        self.batch_rows = []
+        self._batch_sig = None
+        for w in self.batch_scroll.winfo_children():
+            w.destroy()
+
+    def _sync_add_btn(self):
+        btn = getattr(self, "add_btn", None)
+        if btn is None:
+            return
+        on = bool(self.field_urls) and not self.busy and len(self.batch_urls) < BATCH_LIMIT
+        btn.configure(state="normal" if on else "disabled")
+
+    def toggle_batch(self):
+        if len(self.urls) < 2:
+            return
+        self.batch_open = not self.batch_open
+        self._apply_batch_layout()
+
+    def _apply_batch_layout(self):
+        """Show the chevron and file list only when more than one link is loaded."""
+        multi = len(self.urls) > 1
+        if not multi:
+            self.batch_open = False
+            if self._chev_shown:
+                self.info_right.pack_forget()
+                self._chev_shown = False
+            if self._batch_shown:
+                self.batch_box.pack_forget()
+                self._batch_shown = False
+            self.queue_fit(10)
+            return
+        if not self._chev_shown:
+            self.info_right.pack(side="right")
+            self._chev_shown = True
+        self.chevron.configure(text="▴" if self.batch_open else "▾")
+        if self.batch_open:
+            self._render_batch_list()
+            rows = max(1, min(len(self.urls), PREVIEW_ROWS))
+            self.batch_scroll.configure(height=rows * ROW_H)
+            if not self._batch_shown:
+                self.batch_box.pack(fill="x", padx=14, pady=(0, 10))
+                self._batch_shown = True
+        elif self._batch_shown:
+            self.batch_box.pack_forget()
+            self._batch_shown = False
+        self.queue_fit(10)
+
+    def _render_batch_list(self):
+        sig = tuple(self.urls)
+        if sig != self._batch_sig:
+            for w in self.batch_scroll.winfo_children():
+                w.destroy()
+            self.batch_rows = [self._make_batch_row(i) for i in range(len(self.urls))]
+            self._batch_sig = sig
+        for i in range(len(self.urls)):
+            self._fill_batch_row(i)
+
+    def _make_batch_row(self, i):
+        row = ctk.CTkFrame(self.batch_scroll, fg_color="transparent", height=ROW_H)
+        row.pack(fill="x", pady=1)
+        row.pack_propagate(False)
+        num = self.label(row, f"{i + 1}", 11, True, C["muted"], width=18)
+        num.pack(side="left", padx=(2, 6))
+        name = self.label(row, "", 12, anchor="w")
+        name.pack(side="left")
+        meta = self.label(row, "", 11, color=C["muted"], anchor="e")
+        meta.pack(side="right", padx=(8, 6))
+        return {"name": name, "meta": meta}
+
+    def _fill_batch_row(self, i):
+        if i >= len(self.batch_rows) or i >= len(self.urls):
+            return
+        row = self.batch_rows[i]
+        url = self.urls[i]
+        info = self.batch_infos.get(url)
+        status = self.batch_status.get(i, "")
+        if info:
+            title = info.get("title") or "Untitled"
+            size = estimate_size(info, self.fmt, self.quality_var.get())
+            detail = "  ·  ".join(p for p in (fmt_dur(info.get("duration")),
+                                             f"~ {fmt_bytes(size)}" if size else "") if p)
+        else:
+            title = vid_of(url) or url
+            detail = ""
+        if status:
+            detail = f"{status}  ·  {detail}" if detail else status
+        elif not detail:
+            detail = "Reading…"
+        if len(title) > 52:
+            title = title[:51] + "…"
+        self._set_text(row["name"], title)
+        self._set_text(row["meta"], detail)
+
+    def _update_batch_row(self, i, status):
+        self.batch_status[i] = status
+        if self.batch_rows and i < len(self.batch_rows):
+            self._fill_batch_row(i)
     
     def sync_url_hint(self):
         if self.url_var.get():
@@ -771,18 +1269,25 @@ class App(ctk.CTk):
         self.fit_job = self.after(delay, self.fit_title)
 
     def set_title(self, text):
+        if text == self.title_full:
+            return
         self.title_full = text
-        self.title_lbl.configure(text=text)
+        self._set_text(self.title_lbl, text)
         self.queue_fit(10)
 
     def set_meta(self, text):
+        if self.meta_lbl.cget("text") == text:
+            return
         self.meta_lbl.configure(text=text)
         self.queue_fit(10)
 
     def fit_title(self):
         self.fit_job = None
         text = self.title_full
-        avail = self.info_row.winfo_width() - self.meta_lbl.winfo_reqwidth() - 14 - 12
+        reserve = 0
+        if self._chev_shown:
+            reserve = self.info_right.winfo_reqwidth() + 10
+        avail = self.info_row.winfo_width() - self.meta_lbl.winfo_reqwidth() - 14 - 12 - reserve
         if avail <= 40 or not text:
             return
         font = self.title_lbl.cget("font")
@@ -798,20 +1303,22 @@ class App(ctk.CTk):
         if self.title_lbl.cget("text") != text:
             self.title_lbl.configure(text=text)
 
-    def current_vid(self):
-        m = VID_RE.search(self.url_var.get())
-        return m.group(1) if m else (self.info or {}).get("id")
-
-    def find_dup(self, fmt):
-        vid = self.current_vid()
-        if not vid:
-            return None
-        for e in self.history:
-            if e.get("vid") == vid and e["format"] == fmt and os.path.exists(e["path"]):
-                return e
-        return None
+    def _find_dups(self, urls, fmt):
+        """Existing downloads that match any of these links."""
+        by_vid = {e.get("vid"): e for e in self.history
+                  if e["format"] == fmt and os.path.exists(e["path"])}
+        found = []
+        for url in urls:
+            entry = by_vid.get(vid_of(url))
+            if entry is not None:
+                found.append((url, entry))
+        return found
 
     def set_state(self, kind, text):
+        key = (kind, text)
+        if key == self._state_key:
+            return
+        self._state_key = key
         self.dot_color = {"ready": C["green"], "busy": C["accent"], "error": C["red_h"], "done": C["green"],
                           "cancelled": C["accent"]}[kind]
         text_color = {"busy": C["cyan"], "cancelled": C["accent"], "done": C["green"],
@@ -819,44 +1326,34 @@ class App(ctk.CTk):
         self.dot.configure(text_color=self.dot_color)
         self.status_lbl.configure(text=text, text_color=text_color)
 
-    def tick(self):
-        now = time.perf_counter()
-        dt = min(0.05, now - self.last_tick)
-        self.last_tick = now
-        diff = self.target_p - self.shown_p
-        if diff:
-            self.shown_p = self.target_p if abs(diff) <= 0.0005 else self.shown_p + diff * (1 - 0.82 ** (dt * 60))
-            self.bar.set(max(0, min(1, self.shown_p)))
-            self.pct_lbl.configure(text=f"{int(self.shown_p * 100)}%")
-        self.after(16, self.tick)
-
-    def pulse(self):
-        now = time.perf_counter()
-        dt = min(0.1, now - self.last_pulse)
-        self.last_pulse = now
-        if self.busy:
-            self.pulse_t += 6.25 * dt
-            k = (math.sin(self.pulse_t) + 1) / 2
-            self.dot.configure(text_color=lerp_color(self.active_accent, C["card"], k * 0.8))
-        self.after(40, self.pulse)
-
     def set_busy(self, b):
         self.busy = b
         self.dl_btn.configure(state="disabled" if b else "normal", text="Downloading…" if b else "Download")
         self.cancel_btn.configure(state="normal" if b else "disabled", fg_color=C["red"] if b else "#2a1f2e")
+        self._sync_add_btn()
 
     def start_download(self):
-        url = self.url_var.get().strip()
-        if not YT_RE.search(url):
+        urls = list(self.urls)
+        if not urls:
             self.url_entry.configure(border_color=C["red"])
             self.after(900, lambda: self.url_entry.configure(border_color=C["border"]))
             self.set_state("error", "Paste a valid YouTube link first")
             return
-        dup = self.find_dup("M4A" if self.fmt == "MP3" and self.quality_var.get() == M4A_Q else self.fmt)
-        if dup:
-            when = datetime.fromisoformat(dup["time"]).strftime("%b %d at %I:%M %p")
-            if not messagebox.askyesno("Already downloaded",
-                                       f"You already downloaded this as {dup['format']} on {when}:\n\n{dup['title']}\n\nDownload it again?"):
+        key = "M4A" if self.fmt == "MP3" and self.quality_var.get() == M4A_Q else self.fmt
+        dups = self._find_dups(urls, key)
+        if dups:
+            if len(urls) == 1:
+                entry = dups[0][1]
+                when = datetime.fromisoformat(entry["time"]).strftime("%b %d at %I:%M %p")
+                if not messagebox.askyesno(
+                        "Already downloaded",
+                        f"You already downloaded this as {entry['format']} on {when}:\n\n"
+                        f"{entry['title']}\n\nDownload it again?"):
+                    return
+            elif not messagebox.askyesno(
+                    "Already downloaded",
+                    f"{len(dups)} of these {len(urls)} links are already downloaded, for example:\n\n"
+                    f"{dups[0][1]['title']}\n\nDownload them all again?"):
                 return
         folder = self.folder_var.get()
         os.makedirs(folder, exist_ok=True)
@@ -868,36 +1365,174 @@ class App(ctk.CTk):
         self.show_btn.configure(state="disabled")
         for v in self.stat.values():
             v.configure(text="—")
+        self.batch_status = {}
         self.set_busy(True)
         self.set_state("busy", "Starting…")
-        threading.Thread(target=self._worker, args=(url, self.fmt, self.quality_var.get(), folder,
-                                                    self.hevc_var.get()), daemon=True).start()
+        self._start_job(urls, self.fmt, self.quality_var.get(), folder, self.hevc_var.get())
+
+    def _start_job(self, urls, fmt, q, folder, hevc):
+        n = len(urls)
+        job = {"n": n, "fmt": fmt, "q": q, "folder": folder, "hevc": hevc,
+               "lock": threading.Lock(), "frac": [0.0] * n, "done_b": [0] * n,
+               "total_b": [0] * n, "speed": [0] * n, "eta": [0] * n,
+               "started": 0, "ok": 0, "fail": 0, "finished": 0, "closed": False}
+        self.job = job
+        work = queue.Queue()
+        for i, url in enumerate(urls):
+            work.put((i, url))
+        for _ in range(min(MAX_WORKERS, n)):
+            threading.Thread(target=self._batch_loop, args=(work, job), daemon=True).start()
 
     def cancel(self):
         self.cancel_flag.set()
-        if self.proc and self.proc.poll() is None:
-            self.proc.terminate()
+        for proc in list(self.procs):
+            if proc.poll() is None:
+                proc.terminate()
+        job = self.job
+        if job is not None:
+            job["closed"] = True
+            self.job = None
         self.set_state("busy", "Cancelling…")
+        self.ui(self._cancelled_final)
 
-    def _worker(self, url, fmt, q, folder, hevc):
+    def _cancelled_final(self):
+        if self.job is not None:
+            return
+        self.pending_progress = None
+        self.set_busy(False)
+        self.target_p = 0.0
+        self.set_state("cancelled", "Download cancelled")
+
+    def _batch_loop(self, work, job):
+        while not self.cancel_flag.is_set() and not job["closed"]:
+            try:
+                idx, url = work.get_nowait()
+            except queue.Empty:
+                return
+            self.ui(self._file_started, job, idx, url)
+            try:
+                entry = self._download_one(idx, url, job)
+                self.ui(self._file_done, job, idx, entry)
+            except yt_dlp.utils.DownloadCancelled:
+                self.ui(self._file_failed, job, idx, "Cancelled", True)
+            except Exception as ex:
+                if self.cancel_flag.is_set():
+                    self.ui(self._file_failed, job, idx, "Cancelled", True)
+                else:
+                    msg = str(ex).replace("ERROR: ", "")
+                    self.ui(self._file_failed, job, idx, msg[:90] or "Download failed", False)
+
+    def _job_progress(self, job, idx, frac, done, total, speed, eta):
+        """Worker thread: fold one file's progress into the whole batch."""
+        with job["lock"]:
+            if job["closed"]:
+                return
+            job["frac"][idx] = frac
+            job["done_b"][idx] = done
+            job["total_b"][idx] = total
+            job["speed"][idx] = speed or 0
+            job["eta"][idx] = eta or 0
+            n = job["n"]
+            p = sum(job["frac"]) / n if n else 0.0
+            p = 0.0 if p < 0 else (1.0 if p > 1 else p)
+            done_b = sum(job["done_b"])
+            total_b = sum(job["total_b"])
+            speed_b = sum(job["speed"])
+            etas = [e for e in job["eta"] if e]
+            eta_b = max(etas) if etas else None
+        self.pending_progress = (p, done_b, total_b, speed_b, eta_b)
+
+    def _file_started(self, job, idx, url):
+        if job["closed"]:
+            return
+        job["started"] += 1
+        if job["n"] == 1:
+            self.set_state("busy", "Downloading…")
+        else:
+            self.set_state("busy", f"Downloading {min(job['started'], job['n'])} of {job['n']}…")
+            self._update_batch_row(idx, "Downloading…")
+
+    def _job_processing(self, job, idx):
+        if job["closed"]:
+            return
+        if job["n"] == 1:
+            self.set_state("busy", "Processing…")
+        else:
+            self.set_state("busy", f"Processing {idx + 1} of {job['n']}…")
+
+    def _batch_hevc(self, job, idx, p):
+        if job["closed"]:
+            return
+        self.set_state("busy", f"Converting {idx + 1} of {job['n']} to HEVC… {int(p * 100)}%")
+
+    def _file_done(self, job, idx, entry):
+        if job["closed"]:
+            return
+        with job["lock"]:
+            job["frac"][idx] = 1.0
+            job["ok"] += 1
+            job["finished"] += 1
+        if job["n"] == 1:
+            self._done(entry)
+            return
+        self._record_entry(entry)
+        self._update_batch_row(idx, "Done")
+        self._finish_batch(job)
+
+    def _file_failed(self, job, idx, msg, cancelled):
+        if job["closed"]:
+            return
+        with job["lock"]:
+            job["frac"][idx] = 1.0
+            job["fail"] += 1
+            job["finished"] += 1
+        if job["n"] == 1:
+            self._failed(msg, cancelled)
+            return
+        self._update_batch_row(idx, "Cancelled" if cancelled else msg)
+        self._finish_batch(job)
+
+    def _finish_batch(self, job):
+        if job["finished"] < job["n"]:
+            return
+        self.pending_progress = None
+        self.job = None
+        self.set_busy(False)
+        ok, fail, n = job["ok"], job["fail"], job["n"]
+        if self.cancel_flag.is_set():
+            self.target_p = 0.0
+            self.set_state("cancelled", f"Cancelled · {ok} of {n} finished" if ok else "Download cancelled")
+        else:
+            self.target_p = 1.0
+            if fail:
+                self.set_state("error", f"{ok} of {n} completed · {fail} failed")
+            else:
+                self.set_state("done", f"{n} downloads complete")
+        self.show_btn.configure(state="normal" if self.last_path else "disabled")
+        self._set_text(self.stat["left"], "0 B")
+        if self.batch_open:
+            self._render_batch_list()
+
+    def _download_one(self, idx, url, job):
+        fmt, q, folder, hevc = job["fmt"], job["q"], job["folder"], job["hevc"]
         stage = [0]
 
         def hook(d):
-            if self.cancel_flag.is_set():
+            if self.cancel_flag.is_set() or job["closed"]:
                 raise yt_dlp.utils.DownloadCancelled()
             if d["status"] == "downloading":
                 total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
                 done = d.get("downloaded_bytes") or 0
-                n = len(d.get("info_dict", {}).get("requested_formats") or []) or 1
+                parts = len(d.get("info_dict", {}).get("requested_formats") or []) or 1
                 frac = (done / total) if total else 0
-                p = min(1.0, (stage[0] + frac) / n)
-                self.pending_progress = (p, done, total, d.get("speed"), d.get("eta"))
+                self._job_progress(job, idx, min(1.0, (stage[0] + frac) / parts), done, total,
+                                   d.get("speed"), d.get("eta"))
             elif d["status"] == "finished":
                 stage[0] += 1
 
         def pp_hook(d):
             if d["status"] == "started":
-                self.ui(self.set_state, "busy", "Processing…")
+                self.ui(self._job_processing, job, idx)
 
         opts = {"outtmpl": os.path.join(folder, "%(title)s.%(ext)s"), "noplaylist": True, "quiet": True,
                 "no_warnings": True, "progress_hooks": [hook], "postprocessor_hooks": [pp_hook],
@@ -914,58 +1549,58 @@ class App(ctk.CTk):
             cap = f"[height<={m.group()}]" if m else ""
             opts["format"] = f"bestvideo{cap}[ext=mp4]+bestaudio[ext=m4a]/best{cap}[ext=mp4]/best{cap}"
             opts["merge_output_format"] = "mp4"
-        try:
-            self.ui(self.set_state, "busy", "Downloading…")
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                rd = info.get("requested_downloads") or []
-                path = rd[0].get("filepath") if rd else None
-                if not path or not os.path.exists(path):
-                    base = os.path.splitext(ydl.prepare_filename(info))[0]
-                    path = base + (".m4a" if original else ".mp3" if fmt == "MP3" else ".mp4")
-            if self.cancel_flag.is_set():
-                raise yt_dlp.utils.DownloadCancelled()
-            if fmt == "MP4" and hevc:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            rd = info.get("requested_downloads") or []
+            path = rd[0].get("filepath") if rd else None
+            if not path or not os.path.exists(path):
+                base = os.path.splitext(ydl.prepare_filename(info))[0]
+                path = base + (".m4a" if original else ".mp3" if fmt == "MP3" else ".mp4")
+        if self.cancel_flag.is_set() or job["closed"]:
+            raise yt_dlp.utils.DownloadCancelled()
+        if fmt == "MP4" and hevc:
+            if job["n"] == 1:
                 path = self._to_hevc(path, info.get("duration"))
-            entry = {"title": info.get("title", Path(path).stem), "url": url, "vid": info.get("id"),
-                     "format": (Path(path).suffix[1:].upper() or "M4A") if original else fmt, "quality": q, "path": os.path.normpath(path),
-                     "size": os.path.getsize(path), "time": datetime.now().isoformat(timespec="seconds")}
-            self.ui(self._done, entry)
-        except yt_dlp.utils.DownloadCancelled:
-            self.ui(self._failed, "Cancelled", True)
-        except Exception as ex:
-            if self.cancel_flag.is_set():
-                self.ui(self._failed, "Cancelled", True)
             else:
-                msg = str(ex).replace("ERROR: ", "")
-                self.ui(self._failed, msg[:90] or "Download failed", False)
+                path = self._to_hevc(path, info.get("duration"),
+                                     lambda p, i=idx: self.ui(self._batch_hevc, job, i, p))
+        return {"title": info.get("title", Path(path).stem), "url": url, "vid": info.get("id"),
+                "format": (Path(path).suffix[1:].upper() or "M4A") if original else fmt,
+                "quality": q, "path": os.path.normpath(path), "size": os.path.getsize(path),
+                "time": datetime.now().isoformat(timespec="seconds")}
 
-    def _to_hevc(self, path, duration=None):
-        self.ui(self.set_state, "busy", "Converting to HEVC…")
-        self.ui(self._hevc_progress, 0.0)
+    def _to_hevc(self, path, duration=None, report=None):
+        if report is None:
+            self.ui(self.set_state, "busy", "Converting to HEVC…")
+            report = lambda p: self.ui(self._hevc_progress, p)
+        report(0.0)
         out = str(Path(path).with_suffix(".hevc.mp4"))
         total_us = (duration or 0) * 1_000_000
         for name, params in hevc_encoders():
             cmd = ["ffmpeg", "-y", "-v", "error", "-nostats", "-progress", "pipe:1", "-i", path,
                    "-c:v", name, *params, "-tag:v", "hvc1", "-c:a", "copy", out]
             try:
-                self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                             text=True, errors="ignore", creationflags=NO_WINDOW)
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                        text=True, errors="ignore", creationflags=NO_WINDOW)
             except OSError:
                 raise RuntimeError("HEVC conversion failed. Is ffmpeg installed?")
-            for line in self.proc.stdout:
-                if total_us and line.startswith("out_time_us="):
-                    try:
-                        us = int(line.split("=", 1)[1])
-                    except ValueError:
-                        continue
-                    self.ui(self._hevc_progress, max(0.0, min(0.99, us / total_us)))
-            self.proc.wait()
+            self.procs.add(proc)
+            try:
+                for line in proc.stdout:
+                    if total_us and line.startswith("out_time_us="):
+                        try:
+                            us = int(line.split("=", 1)[1])
+                        except ValueError:
+                            continue
+                        report(max(0.0, min(0.99, us / total_us)))
+                proc.wait()
+            finally:
+                self.procs.discard(proc)
             if self.cancel_flag.is_set():
                 if os.path.exists(out):
                     os.remove(out)
                 raise yt_dlp.utils.DownloadCancelled()
-            if self.proc.returncode == 0:
+            if proc.returncode == 0:
                 os.replace(out, path)
                 return path
             if os.path.exists(out):
@@ -974,25 +1609,29 @@ class App(ctk.CTk):
 
     def _hevc_progress(self, p):
         self.target_p = p
-        self.status_lbl.configure(text=f"Converting to HEVC… {int(p * 100)}%")
+        self._set_text(self.status_lbl, f"Converting to HEVC… {int(p * 100)}%")
 
     def _progress(self, p, done, total, speed, eta):
         self.target_p = p
         if total:
-            self.stat["done"].configure(text=f"{fmt_bytes(done)} / {fmt_bytes(total)}")
-            self.stat["left"].configure(text=fmt_bytes(max(0, total - done)))
+            self._set_text(self.stat["done"], f"{fmt_bytes(done)} / {fmt_bytes(total)}")
+            self._set_text(self.stat["left"], fmt_bytes(max(0, total - done)))
         if speed:
-            self.stat["speed"].configure(text=f"{fmt_bytes(speed)}/s · {fmt_dur(eta) if eta else '—'}")
+            self._set_text(self.stat["speed"],
+                           f"{fmt_bytes(speed)}/s · {fmt_dur(eta) if eta else '—'}")
 
-    def _done(self, entry):
-        self.pending_progress = None
+    def _record_entry(self, entry):
         self.history.insert(0, entry)
         del self.history[HISTORY_LIMIT:]
         save_json(HISTORY_FILE, self.history)
         self.last_path = entry["path"]
+
+    def _done(self, entry):
+        self.pending_progress = None
+        self.job = None
+        self._record_entry(entry)
         self.target_p = 1.0
         self.set_busy(False)
-        t = entry["title"]
         self.set_state("done", "Download successful")
         self.show_btn.configure(state="normal")
         self.stat["done"].configure(text=fmt_bytes(entry["size"]))
@@ -1000,6 +1639,7 @@ class App(ctk.CTk):
 
     def _failed(self, msg, cancelled):
         self.pending_progress = None
+        self.job = None
         self.set_busy(False)
         self.target_p = 0.0
         self.set_state("cancelled" if cancelled else "error", "Download cancelled" if cancelled else msg)

@@ -1,3 +1,6 @@
 Music/
 Video/
 Downloads/
+__pycache__/
+*.pyc
+.freebuff
