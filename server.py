@@ -33,6 +33,7 @@ class InfoRequest(BaseModel):
     urls: list[str]
     format: str = "MP3"
     quality: str = "128 kbps"
+    hevc: bool = False
 
 class DownloadRequest(BaseModel):
     urls: list[str]
@@ -65,7 +66,7 @@ def health(): return {"ok": True}
 
 @app.post("/api/info")
 def info(req: InfoRequest):
-    try: return {"items": manager.info(req.urls, req.format, req.quality)}
+    try: return {"items": manager.info(req.urls, req.format, req.quality, req.hevc)}
     except ValueError as ex: raise HTTPException(400, str(ex))
 
 @app.post("/api/download")

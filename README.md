@@ -1,8 +1,9 @@
 # Streamgrab
 
-Streamgrab is a Windows desktop app for downloading YouTube and YouTube Music
-links as MP4 video or MP3 audio. The desktop UI is React + Tailwind; FastAPI
-keeps download work in Python and streams progress over Server-Sent Events.
+Streamgrab is a Windows desktop app for downloading video or audio from any
+HTTP(S) site supported by yt-dlp as MP4 video or MP3 audio. DRM-protected
+services are not supported. The desktop UI is React + Tailwind; FastAPI keeps
+download work in Python and streams progress over Server-Sent Events.
 
 ## Requirements
 
@@ -72,8 +73,9 @@ curl http://127.0.0.1:PORT/api/history
 ```
 
 `/api/events` emits JSON snapshots as SSE events while a job changes and sends
-keepalives when idle. The API validates YouTube hosts, formats, qualities,
-configured folder access, and history file actions. It has no generic open-path
+keepalives when idle. The API validates HTTP(S) URLs, formats, qualities,
+configured folder access, and history file actions. URL support follows yt-dlp;
+DRM-protected services are not supported. The API has no generic open-path
 endpoint.
 
 ## Features
@@ -81,8 +83,9 @@ endpoint.
 - MP4 video with Best available, 1080p, 720p, 480p, and 360p caps
 - MP3 at 128, 192, 256, or 320 kbps, or original M4A audio
 - Optional hardware-probed HEVC conversion, with libx265 fallback
+- Size previews adjust for HEVC using a ratio learned from your previous conversions.
 - Up to 20 deduplicated links and two concurrent downloads
-- Duplicate detection by video ID and output format
+- Duplicate detection by video ID (or URL for other sites) and output format
 - Download history, search, per-format quality settings, and HEVC preference
 - Cancel support and per-file batch state
 

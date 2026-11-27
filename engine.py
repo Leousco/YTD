@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import statistics
 import subprocess
 import sys
 import threading
@@ -18,12 +19,12 @@ SETTINGS_FILE = CONFIG_DIR / "settings.json"
 HISTORY_LIMIT = 10
 BATCH_LIMIT = 20
 MAX_WORKERS = 2
+HEVC_FALLBACK_RATIO = 0.55
 M4A_Q = "M4A \ufffd Original"
 MP3_Q = [M4A_Q, "128 kbps", "192 kbps", "256 kbps", "320 kbps"]
 MP4_Q = ["Best available", "1080p", "720p", "480p", "360p"]
-YT_RE = re.compile(r"(youtube\.com|youtu\.be|music\.youtube\.com)", re.I)
 VID_RE = re.compile(r"(?:v=|youtu\.be/|shorts/|embed/)([\w-]{11})")
-URL_RE = re.compile(r"https?://[^\s<>\"']+")
+URL_RE = re.compile(r"https?://[^\s<>\"']+", re.I)
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 HEVC_HW = (("hevc_nvenc", ["-preset", "p5", "-rc", "vbr", "-cq", "28", "-b:v", "0"]),
            ("hevc_qsv", ["-preset", "medium", "-global_quality", "27"]),
@@ -50,10 +51,12 @@ def parse_urls(text):
     for raw in URL_RE.findall(text or ""):
         url = raw.rstrip(").,;]}'\"")
         try:
-            host = (urlsplit(url).hostname or "").lower().rstrip(".")
+            parsed = urlsplit(url)
+            host = parsed.hostname
         except ValueError:
-            host = ""
-        if url not in urls and host in {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be", "www.youtu.be"}:
+            parsed = None
+            host = None
+        if url not in urls and parsed and parsed.scheme in ("http", "https") and host:
             urls.append(url)
             if len(urls) >= BATCH_LIMIT:
                 break
@@ -62,7 +65,14 @@ def parse_urls(text):
 
 def vid_of(url):
     m = VID_RE.search(url or "")
-    return m.group(1) if m else None
+    return m.group(1) if m else url
+
+
+def error_message(ex):
+    message = str(ex).replace("ERROR: ", "").strip()
+    if re.search(r"\bdrm\b|digital rights management", message, re.I):
+        return "DRM-protected media is not supported."
+    return message[:180] or "Download failed"
 
 
 def fmt_bytes(n):
@@ -83,27 +93,43 @@ def fmt_dur(s):
     return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
 
 
-def estimate_size(info, fmt, q):
+def estimate_size(info, fmt, q, hevc=False, hevc_ratio=HEVC_FALLBACK_RATIO):
     dur = info.get("duration") or 0
+    formats = info.get("formats") or []
+    def finish(size):
+        if size is not None and fmt == "MP4" and hevc:
+            return size * hevc_ratio
+        return size
     def fs(f):
         return f.get("filesize") or f.get("filesize_approx") or (f.get("tbr") or 0) * 1000 / 8 * dur
+    def audio_fs(f):
+        return f.get("filesize") or f.get("filesize_approx") or (f.get("abr") or f.get("tbr") or 0) * 1000 / 8 * dur
+    def info_fs():
+        return info.get("filesize") or info.get("filesize_approx") or None
     if fmt == "MP3" and q == M4A_Q:
-        auds = [f for f in info.get("formats", []) if f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")]
+        auds = [f for f in formats if f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")]
         auds = [f for f in auds if f.get("ext") == "m4a"] or auds
-        a = max(auds, key=fs, default=None)
-        return (fs(a) if a else 0) or None
+        if not auds:
+            auds = [f for f in formats if f.get("acodec") not in (None, "none")]
+        a = max(auds, key=audio_fs, default=None)
+        return finish((audio_fs(a) if a else 0) or info_fs())
     if fmt == "MP3":
-        return dur * int(re.match(r"\d+", q).group()) * 1000 / 8
+        return finish(dur * int(re.match(r"\d+", q).group()) * 1000 / 8 or info_fs())
     m = re.match(r"\d+", q)
     h = int(m.group()) if m else 99999
-    fl = info.get("formats") or []
-    vids = [f for f in fl if f.get("vcodec") not in (None, "none") and f.get("acodec") in (None, "none") and (f.get("height") or 0) <= h]
-    auds = [f for f in fl if f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")]
+    vids = [f for f in formats if f.get("vcodec") not in (None, "none") and f.get("acodec") in (None, "none") and (f.get("height") or 0) <= h]
+    auds = [f for f in formats if f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")]
     vids = [f for f in vids if f.get("ext") == "mp4"] or vids
     auds = [f for f in auds if f.get("ext") == "m4a"] or auds
     v = max(vids, key=lambda f: ((f.get("height") or 0), fs(f)), default=None)
     a = max(auds, key=fs, default=None)
-    return ((fs(v) if v else 0) + (fs(a) if a else 0)) or None
+    candidates = []
+    if v and a and fs(v) and fs(a):
+        candidates.append(((v.get("height") or 0), fs(v) + fs(a)))
+    combined = [f for f in formats if f.get("vcodec") not in (None, "none") and f.get("acodec") not in (None, "none") and (f.get("height") or 0) <= h]
+    candidates.extend(((f.get("height") or 0, fs(f)) for f in combined if fs(f)))
+    size = max(candidates, key=lambda candidate: (candidate[0], candidate[1]))[1] if candidates else info_fs()
+    return finish(size)
 
 
 def ffmpeg_works(args):
@@ -155,6 +181,14 @@ class DownloadManager:
             save_json(SETTINGS_FILE, self.settings)
             return dict(self.settings)
 
+    def hevc_ratio(self):
+        with self.lock:
+            ratios = self.settings.get("hevc_ratios", [])
+            if not isinstance(ratios, list):
+                ratios = []
+            valid = [r for r in ratios if isinstance(r, (int, float)) and not isinstance(r, bool) and 0.2 <= r <= 1.2]
+            return statistics.median(valid) if len(valid) >= 3 else HEVC_FALLBACK_RATIO
+
     def get_history(self, q=""):
         with self.lock:
             return [dict(e, exists=os.path.exists(e.get("path", ""))) for e in self.history if q.lower() in e.get("title", "").lower()]
@@ -165,10 +199,12 @@ class DownloadManager:
             else: self.history = [e for i, e in enumerate(self.history) if str(i) != str(entry_id) and e.get("time") != entry_id]
             save_json(HISTORY_FILE, self.history)
 
-    def info(self, urls, fmt, quality):
+    def info(self, urls, fmt, quality, hevc=False):
         if quality == "M4A · Original": quality = M4A_Q
         urls = parse_urls("\n".join(urls))
-        if not urls: raise ValueError("No valid YouTube URLs")
+        if not urls: raise ValueError("No valid HTTP(S) URLs")
+        hevc_est = fmt == "MP4" and hevc
+        hevc_ratio = self.hevc_ratio() if hevc_est else HEVC_FALLBACK_RATIO
         def fetch(url):
             with yt_dlp.YoutubeDL({"quiet": True, "noplaylist": True, "skip_download": True, "no_warnings": True}) as ydl:
                 return ydl.extract_info(url, download=False)
@@ -178,8 +214,11 @@ class DownloadManager:
             for future in as_completed(futures):
                 i = futures[future]; url = urls[i]
                 try:
-                    d = future.result(); results[i] = {"url": url, "id": d.get("id"), "title": d.get("title", "Untitled"), "duration": d.get("duration"), "size": estimate_size(d, fmt, quality)}
-                except Exception as ex: results[i] = {"url": url, "error": str(ex)[:180]}
+                    d = future.result()
+                    size = estimate_size(d, fmt, quality, hevc=hevc_est, hevc_ratio=hevc_ratio)
+                    results[i] = {"url": url, "id": d.get("id"), "title": d.get("title", "Untitled"), "duration": d.get("duration"), "size": size}
+                    if hevc_est and size is not None: results[i]["hevc_est"] = True
+                except Exception as ex: results[i] = {"url": url, "error": error_message(ex)}
         return results
 
     def duplicates(self, urls, fmt):
@@ -190,7 +229,7 @@ class DownloadManager:
     def start(self, urls, fmt, quality, folder, hevc, force=False):
         if quality == "M4A · Original": quality = M4A_Q
         urls = parse_urls("\n".join(urls))
-        if not urls: raise ValueError("No valid YouTube URLs")
+        if not urls: raise ValueError("No valid HTTP(S) URLs")
         if len(urls) > BATCH_LIMIT: raise ValueError("At most 20 links can be downloaded at once")
         if fmt not in ("MP3", "MP4"): raise ValueError("Invalid format")
         if quality not in (MP3_Q if fmt == "MP3" else MP4_Q): raise ValueError("Invalid quality")
@@ -279,15 +318,23 @@ class DownloadManager:
                 info=ydl.extract_info(url,download=True); rd=info.get("requested_downloads") or []; path=rd[0].get("filepath") if rd else None
                 if not path or not os.path.exists(path): path=os.path.splitext(ydl.prepare_filename(info))[0]+(".m4a" if original else ".mp3" if fmt=="MP3" else ".mp4")
             if self.cancel_event.is_set(): raise yt_dlp.utils.DownloadCancelled()
-            if fmt=="MP4" and hevc: path=self._to_hevc(path,info.get("duration"),j,idx)
-            entry={"title":info.get("title",Path(path).stem),"url":url,"vid":info.get("id"),"format":(Path(path).suffix[1:].upper() or "M4A") if original else fmt,"quality":q,"path":os.path.normpath(path),"size":os.path.getsize(path),"time":datetime.now().isoformat(timespec="seconds")}
+            if fmt=="MP4" and hevc:
+                original_size=os.path.getsize(path)
+                path=self._to_hevc(path,info.get("duration"),j,idx)
+                final_size=os.path.getsize(path)
+                if original_size > 0:
+                    with self.lock:
+                        ratios=self.settings.get("hevc_ratios",[])
+                        if not isinstance(ratios,list): ratios=[]
+                        self.settings_update({"hevc_ratios":(ratios+[final_size/original_size])[-10:]})
+            entry={"title":info.get("title",Path(path).stem),"url":url,"vid":vid_of(url),"format":(Path(path).suffix[1:].upper() or "M4A") if original else fmt,"quality":q,"path":os.path.normpath(path),"size":os.path.getsize(path),"time":datetime.now().isoformat(timespec="seconds")}
             with self.lock:
                 self.history.insert(0,entry); del self.history[HISTORY_LIMIT:]; save_json(HISTORY_FILE,self.history); j["ok"]+=1; j["files"][idx].update(status="Done",title=entry["title"]); j["last_path"]=entry["path"]; j["frac"][idx]=1
                 self.changed.set()
         except (yt_dlp.utils.DownloadCancelled, DownloadCancelled):
             with self.lock: j["fail"]+=1; j["files"][idx]["status"]="Cancelled"; j["frac"][idx]=0; self.changed.set()
         except Exception as ex:
-            with self.lock: j["fail"]+=1; j["files"][idx]["status"]=str(ex).replace("ERROR: ","")[:120] or "Download failed"; j["frac"][idx]=1; self.changed.set()
+            with self.lock: j["fail"]+=1; j["files"][idx]["status"]=error_message(ex)[:120]; j["frac"][idx]=1; self.changed.set()
 
     def _to_hevc(self,path,duration,j,idx):
         out=str(Path(path).with_suffix(".hevc.mp4")); total=(duration or 0)*1_000_000
